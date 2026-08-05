@@ -1,8 +1,8 @@
-# Kokuban Kernel CI Center
+# Bahlil Kernel CI Center
 
 ## 项目概述
 
-Kokuban Kernel CI Center 是一个专为 Android Linux 内核编译设计的集中式持续集成与交付（CI/CD）平台。该项目旨在通过标准化的构建流程，解决多设备内核维护中的重复性工作问题，并将构建模式收敛到当前仍在维护的 `LKM` 与 `ReSukiSU` 两条路径。
+Bahlil Kernel CI Center 是一个专为 Android Linux 内核编译设计的集中式持续集成与交付（CI/CD）平台。该项目旨在通过标准化的构建流程，解决多设备内核维护中的重复性工作问题，并将构建模式收敛到当前仍在维护的 `LKM` 与 `ReSukiSU` 两条路径。
 
 核心架构采用 **Rust** 编写的 CLI 工具（`kokuban_ci_core`）作为逻辑中枢，配合 **GitHub Actions** 进行流程编排，实现了从源码同步、工具链配置、KernelSU 集成到最终构建发布的完全自动化。
 

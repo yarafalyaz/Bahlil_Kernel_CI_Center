@@ -60,7 +60,7 @@ jobs:
             
       - name: Commit and Push
         run: |
-          git config --global user.name "Kokuban-Bot"
+          git config --global user.name "Bahlil-Bot"
           git config --global user.email "bot@kokuban.dev"
           git add configs/projects.json
           git commit -m "feat: add new project ${{ inputs.project_key }}"

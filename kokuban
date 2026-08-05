@@ -7,7 +7,7 @@ CORE_BIN="${KOKUBAN_CORE:-$CORE_DIR/target/release/kokuban_ci_core}"
 
 usage() {
   cat <<'EOF'
-Kokuban local CLI
+Bahlil local CLI
 
 Usage:
   ./kokuban list

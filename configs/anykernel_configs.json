@@ -1,6 +1,6 @@
 {
   "kalama_z": {
-    "kernel_string": "Z5-Kokuban-Kernel",
+    "kernel_string": "Z5-Bahlil-Kernel",
     "device_check": false,
     "modules": false,
     "systemless": true,
@@ -22,7 +22,7 @@
     "boot_finalize": "flash_boot"
   },
   "sun": {
-    "kernel_string": "S25-Kokuban-Kernel",
+    "kernel_string": "S25-Bahlil-Kernel",
     "device_check": true,
     "modules": false,
     "systemless": false,
@@ -45,7 +45,7 @@
     "boot_finalize": "flash_boot"
   },
   "kalama": {
-    "kernel_string": "S23-Kokuban-Kernel",
+    "kernel_string": "S23-Bahlil-Kernel",
     "device_check": true,
     "modules": false,
     "systemless": true,
@@ -67,7 +67,7 @@
     "boot_finalize": "flash_boot"
   },
   "kalama_tabs9": {
-    "kernel_string": "TabS9-Kokuban-Kernel",
+    "kernel_string": "TabS9-Bahlil-Kernel",
     "device_check": false,
     "modules": false,
     "systemless": true,
@@ -89,7 +89,7 @@
     "boot_finalize": "flash_boot"
   },
   "pineapple": {
-    "kernel_string": "S24-Snapdragon-Kokuban-Kernel",
+    "kernel_string": "S24-Snapdragon-Bahlil-Kernel",
     "device_check": true,
     "modules": false,
     "systemless": true,
@@ -113,7 +113,7 @@
     "boot_finalize": "flash_boot"
   },
   "mt6989": {
-    "kernel_string": "TabS10-Kokuban-Kernel",
+    "kernel_string": "TabS10-Bahlil-Kernel",
     "device_check": false,
     "modules": false,
     "systemless": true,
@@ -137,7 +137,7 @@
     "boot_finalize": "flash_boot"
   },
   "pineapple_z": {
-    "kernel_string": "Z6-Kokuban-Kernel",
+    "kernel_string": "Z6-Bahlil-Kernel",
     "device_check": true,
     "modules": false,
     "systemless": true,
@@ -161,7 +161,7 @@
     "boot_finalize": "flash_boot"
   },
   "canoe": {
-    "kernel_string": "Xiaomi17-Kokuban-Kernel",
+    "kernel_string": "Xiaomi17-Bahlil-Kernel",
     "device_check": true,
     "modules": false,
     "systemless": false,

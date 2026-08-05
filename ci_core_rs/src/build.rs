@@ -304,7 +304,7 @@ fn build_sm8750_localversion(base: &str, short_sha: &str, kernel_version: &str) 
     const UNAME_MAX_VISIBLE_LEN: usize = 63;
 
     let normalized_base = if base.trim().is_empty() {
-        "-Kokuban".to_string()
+        "-Bahlil".to_string()
     } else {
         format!("-{}", base.trim().trim_start_matches('-'))
     };
@@ -542,7 +542,7 @@ write_boot; # use flash_boot to skip ramdisk repack, e.g. for devices with init_
         fs::write(temp_dir.join("anykernel.sh"), template).unwrap();
 
         let config = AnyKernelConfig {
-            kernel_string: "S23-Knox-Disabled-Kernel-Kokuban".to_string(),
+            kernel_string: "S23-Knox-Disabled-Kernel-Bahlil".to_string(),
             device_check: true,
             modules: false,
             systemless: true,
@@ -563,7 +563,7 @@ write_boot; # use flash_boot to skip ramdisk repack, e.g. for devices with init_
         apply_anykernel_config(&temp_dir, &config).unwrap();
         let rendered = fs::read_to_string(temp_dir.join("anykernel.sh")).unwrap();
 
-        assert!(rendered.contains("kernel.string=S23-Knox-Disabled-Kernel-Kokuban"));
+        assert!(rendered.contains("kernel.string=S23-Knox-Disabled-Kernel-Bahlil"));
         assert!(rendered.contains("device.name1=dm3q"));
         assert!(rendered.contains("device.name3=dm1q"));
         assert!(rendered.contains("BLOCK=/dev/block/by-name/boot;"));

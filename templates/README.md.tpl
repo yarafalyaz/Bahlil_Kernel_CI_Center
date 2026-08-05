@@ -1,5 +1,5 @@
 <!-- BEGIN-ZH -->
-# Kokuban 内核 for __DEVICE_NAME_CN__
+# Bahlil 内核 for __DEVICE_NAME_CN__
 
 <p align="center">
 <img src="https://raw.githubusercontent.com/YuzakiKokuban/Kokuban_Kernel_CI_Center/main/docs/kokuban_logo.png" alt="Logo" width="150">
@@ -54,7 +54,7 @@
 <!-- END-ZH -->
 
 <!-- BEGIN-EN -->
-# Kokuban Kernel for __DEVICE_NAME_EN__
+# Bahlil Kernel for __DEVICE_NAME_EN__
 
 <p align="center">
 <img src="https://raw.githubusercontent.com/YuzakiKokuban/Kokuban_Kernel_CI_Center/main/docs/kokuban_logo.png" alt="Logo" width="150">

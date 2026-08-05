@@ -7,7 +7,7 @@
   "z5_sm8550": {
     "repo": "YuzakiKokuban/android_kernel_samsung_sm8550_Z5",
     "defconfig": "defconfig",
-    "localversion_base": "-android13-Kokuban-Mei-FZB2",
+    "localversion_base": "-android13-Bahlil-Mei-FZB2",
     "lto": "thin",
     "supported_ksu": [
       "resukisu"
@@ -50,7 +50,7 @@
   "s25_sm8750": {
     "repo": "YuzakiKokuban/android_kernel_samsung_sm8750",
     "defconfig": "defconfig",
-    "localversion_base": "-android15-Kokuban-Herta-CZF1",
+    "localversion_base": "-android15-Bahlil-Herta-CZF1",
     "supported_ksu": [
       "resukisu"
     ],
@@ -96,7 +96,7 @@
   "s23_sm8550": {
     "repo": "YuzakiKokuban/android_kernel_samsung_sm8550_S23",
     "defconfig": "defconfig",
-    "localversion_base": "-android13-Kokuban-Firefly-EZB6",
+    "localversion_base": "-android13-Bahlil-Firefly-EZB6",
     "lto": "thin",
     "supported_ksu": [
       "resukisu"
@@ -140,7 +140,7 @@
   "tabs9_sm8550": {
     "repo": "YuzakiKokuban/android_kernel_samsung_sm8550_TabS9",
     "defconfig": "defconfig",
-    "localversion_base": "-android13-Kokuban-Hutao-DZA1",
+    "localversion_base": "-android13-Bahlil-Hutao-DZA1",
     "lto": "thin",
     "supported_ksu": [
       "resukisu"
@@ -184,7 +184,7 @@
   "s24_sm8650": {
     "repo": "YuzakiKokuban/android_kernel_samsung_sm8650",
     "defconfig": "defconfig",
-    "localversion_base": "-android14-Kokuban-Elysia-DZE1",
+    "localversion_base": "-android14-Bahlil-Elysia-DZE1",
     "supported_ksu": [
       "resukisu"
     ],
@@ -227,7 +227,7 @@
   "tabs10_mt6989": {
     "repo": "YuzakiKokuban/android_kernel_samsung_mt6989_TabS10",
     "defconfig": "defconfig",
-    "localversion_base": "-android14-Kokuban-Exusiai-CZB5",
+    "localversion_base": "-android14-Bahlil-Exusiai-CZB5",
     "supported_ksu": [
       "resukisu"
     ],
@@ -269,7 +269,7 @@
   "z6_sm8650": {
     "repo": "YuzakiKokuban/android_kernel_samsung_sm8650_Z6",
     "defconfig": "defconfig",
-    "localversion_base": "-android14-Kokuban-Cyrene-CYI7",
+    "localversion_base": "-android14-Bahlil-Cyrene-CYI7",
     "lto": "",
     "supported_ksu": [
       "resukisu"

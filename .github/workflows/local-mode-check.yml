@@ -31,7 +31,7 @@ jobs:
           ./scripts/check-shell.sh
           ./scripts/test-kokuban-cli.sh
 
-      - name: Kokuban validation
+      - name: Bahlil validation
         run: |
           ./kokuban validate
           ./kokuban plan s23_sm8550 main default --no-susfs --no-bbg
