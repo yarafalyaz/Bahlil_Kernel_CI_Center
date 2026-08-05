@@ -316,7 +316,7 @@
   "mi17_sm8850": {
     "repo": "yarafalyaz/android_kernel_xiaomi_sm8850",
     "defconfig": "gki_defconfig",
-    "localversion_base": "-android16-Kokuban-SilverWolf",
+    "localversion_base": "-android16-Nezha-Bahlil",
     "supported_ksu": [
       "resukisu"
     ],
@@ -335,7 +335,7 @@
     ],
     "lto": "none",
     "anykernel_config": "canoe",
-    "zip_name_prefix": "Mi17_Kernel",
+    "zip_name_prefix": "Nezha_Bahlil_Kernel",
     "susfs": {
       "repo": "https://gitlab.com/simonpunk/susfs4ksu.git",
       "branch": "gki-android16-6.12",
