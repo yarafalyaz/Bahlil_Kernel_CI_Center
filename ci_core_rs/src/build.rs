@@ -1314,8 +1314,8 @@ pub fn handle_build(
         if custom_localversion.is_none() {
             if project_key == "nezha_sm8850" {
                 localversion = format!(
-                    "{}-{}-SuSFS-4k",
-                    proj.localversion_base, build_variant_suffix
+                    "{}-SuSFS-4k",
+                    proj.localversion_base
                 );
             } else {
                 localversion = format!("{}-g{}-4k", proj.localversion_base, short_sha);
@@ -1550,12 +1550,12 @@ pub fn handle_build(
 
     if do_release {
         let release_tag = format!(
-            "{}-{}{}-{}",
-            zip_prefix, build_variant_suffix, feature_suffix, date_str
+            "{}{}-{}",
+            zip_prefix, feature_suffix, date_str
         );
         let release_title = format!(
-            "{} {}{} Build ({})",
-            zip_prefix, build_variant_suffix, feature_suffix, date_str
+            "{} {} Build ({})",
+            zip_prefix, feature_suffix, date_str
         );
 
         if Path::new(&final_zip_name).exists() {
