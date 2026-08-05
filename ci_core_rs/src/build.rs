@@ -1313,8 +1313,8 @@ pub fn handle_build(
         if custom_localversion.is_none() {
             if project_key == "nezha_sm8850" {
                 localversion = format!(
-                    "{}-{}-g{}-4k",
-                    proj.localversion_base, build_variant_suffix, short_sha
+                    "{}-{}-SuSFS-4k",
+                    proj.localversion_base, build_variant_suffix
                 );
             } else {
                 localversion = format!("{}-g{}-4k", proj.localversion_base, short_sha);
