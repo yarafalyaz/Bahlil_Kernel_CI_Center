@@ -4,7 +4,7 @@
     "resukisu_chat_id": "@ReSukiSU",
     "resukisu_topic_id": 36
   },
-  "mi17_sm8850": {
+  "nezha_sm8850": {
     "repo": "yarafalyaz/android_kernel_xiaomi_sm8850",
     "defconfig": "gki_defconfig",
     "localversion_base": "-android16-Nezha-Bahlil-Ganteng",

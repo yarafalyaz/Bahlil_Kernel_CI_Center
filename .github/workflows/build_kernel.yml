@@ -7,7 +7,7 @@ on:
         required: true
         type: choice
         options:
-          - mi17_sm8850
+          - nezha_sm8850
       branch:
         description: 'Git Branch/Tag'
         required: true

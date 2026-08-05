@@ -50,7 +50,7 @@ Bahlil Kernel CI Center 是一个专为 Android Linux 内核编译设计的集�
 | **Tab S9** | Galaxy Tab S9 Series (SM8550) | `tabs9_sm8550` |
 | **Tab S10** | Galaxy Tab S10 (MT6989) | `tabs10_mt6989` |
 | **Z6** | Galaxy Z Fold/Flip 6 (SM8650) | `z6_sm8650` |
-| **Mi17** | Xiaomi 17 Series (SM8850) | `mi17_sm8850` |
+| **Nezha** | Xiaomi 17 Series (SM8850) | `nezha_sm8850` |
 
 ## 构建与使用
 
@@ -111,7 +111,7 @@ sudo apt-get install -y build-essential git libncurses5-dev bc bison flex \
 ./kokuban build s25_sm8750 resukisu resukisu --with-bbg
 
 # 指定自定义缓存根目录
-./kokuban build mi17_sm8850 resukisu resukisu --local-root ~/kokuban-local-cache
+./kokuban build nezha_sm8850 resukisu resukisu --local-root ~/kokuban-local-cache
 ```
 
 `./kokuban` 是仓库根目录中的轻量 CLI 包装器。第一次运行会自动编译 `kokuban_ci_core` 的 release 版，之后会直接复用 `ci_core_rs/target/release/kokuban_ci_core`。常用命令：

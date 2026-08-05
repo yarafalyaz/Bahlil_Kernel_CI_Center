@@ -1311,7 +1311,7 @@ pub fn handle_build(
 
     if is_sm8850 {
         if custom_localversion.is_none() {
-            if project_key == "mi17_sm8850" {
+            if project_key == "nezha_sm8850" {
                 localversion = format!(
                     "{}-{}-g{}-4k",
                     proj.localversion_base, build_variant_suffix, short_sha

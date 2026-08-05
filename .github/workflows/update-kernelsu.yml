@@ -6,7 +6,7 @@ on:
         description: 'Project to update'
         required: true
         type: choice
-        options: [mi17_sm8850]
+        options: [nezha_sm8850]
       branch:
         description: 'Variant (KernelSU Type)'
         required: true
