@@ -7,7 +7,7 @@
   "nezha_sm8850": {
     "repo": "yarafalyaz/android_kernel_xiaomi_sm8850",
     "defconfig": "gki_defconfig",
-    "localversion_base": "-android16-Nezha-Bahlil-Ganteng",
+    "localversion_base": "-Pertamax16-Nezha-Bahlil-Ganteng",
     "supported_ksu": [
       "resukisu"
     ],
