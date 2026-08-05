@@ -135,11 +135,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
-          gh release download ci-core-latest -p "kokuban_ci_core"
-          chmod +x kokuban_ci_core
+          gh release download ci-core-latest -p "bahlil_ci_core"
+          chmod +x bahlil_ci_core
 
       - name: Parse Configuration
-        run: ./kokuban_ci_core parse --project ${{ env.PROJECT }}
+        run: ./bahlil_ci_core parse --project ${{ env.PROJECT }}
 
       - name: Checkout Kernel Source
         uses: actions/checkout@v7
@@ -189,13 +189,13 @@ jobs:
           fi
           ARGS+=("--apply-susfs" "${{ env.APPLY_SUSFS }}")
           ARGS+=("--apply-bbg" "${{ env.APPLY_BBG }}")
-          ./kokuban_ci_core build "${ARGS[@]}"
+          ./bahlil_ci_core build "${ARGS[@]}"
 
       - name: Collect Build Artifacts
         if: always()
         id: collect-artifacts
         run: |
-          if ./kokuban_ci_core collect-artifacts --artifact-dir "$ARTIFACT_DIR"; then
+          if ./bahlil_ci_core collect-artifacts --artifact-dir "$ARTIFACT_DIR"; then
             :
           else
             echo "collect-artifacts command unavailable, falling back to shell collector."

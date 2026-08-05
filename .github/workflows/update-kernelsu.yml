@@ -30,8 +30,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
-          gh release download ci-core-latest -p "kokuban_ci_core" --clobber
-          chmod +x kokuban_ci_core
+          gh release download ci-core-latest -p "bahlil_ci_core" --clobber
+          chmod +x bahlil_ci_core
 
       - name: Determine Commit Hash
         id: hash
@@ -48,7 +48,7 @@ jobs:
 
       - name: Execute Update
         run: |
-          ./kokuban_ci_core update \
+          ./bahlil_ci_core update \
             --token "${{ secrets.GH_TOKEN }}" \
             --project "${{ inputs.project }}" \
             --variant "${{ inputs.branch }}" \

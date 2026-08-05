@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CORE_DIR="$SCRIPT_DIR/ci_core_rs"
-CORE_BIN="${KOKUBAN_CORE:-$CORE_DIR/target/release/kokuban_ci_core}"
+CORE_BIN="${KOKUBAN_CORE:-$CORE_DIR/target/release/bahlil_ci_core}"
 
 usage() {
   cat <<'EOF'
@@ -73,7 +73,7 @@ ensure_core() {
   fi
 
   if [ "$needs_build" -eq 1 ]; then
-    echo "Building kokuban_ci_core release binary..."
+    echo "Building bahlil_ci_core release binary..."
     cargo build --release --manifest-path "$CORE_DIR/Cargo.toml"
   fi
 }
