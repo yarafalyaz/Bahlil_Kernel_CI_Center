@@ -740,7 +740,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "kokuban_ci_core"
+name = "bahlil_ci_core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
