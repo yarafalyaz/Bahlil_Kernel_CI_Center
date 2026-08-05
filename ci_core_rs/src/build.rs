@@ -1279,6 +1279,7 @@ pub fn handle_build(
     build_env.insert("HOSTCC".to_string(), cc_cmd.clone());
     build_env.insert("LD".to_string(), "ld.lld".to_string());
     build_env.insert("HOSTLD".to_string(), "ld.lld".to_string());
+    build_env.insert("KBUILD_BUILD_TIMESTAMP".to_string(), chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string());
 
     let build_variant_suffix = variant_suffix(&branch);
 
