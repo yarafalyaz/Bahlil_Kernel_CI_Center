@@ -728,6 +728,16 @@ fn apply_susfs_overlay(kernel_source_path: &Path, susfs: &SusfsConfig) -> Result
         return Err(anyhow!("SuSFS patch not found: {:?}", patch_path));
     }
 
+    if let Ok(content) = fs::read_to_string(&patch_path) {
+        if content.contains("getname_flags(filename, lookup_flags, NULL);") {
+            let fixed_content = content.replace(
+                "getname_flags(filename, lookup_flags, NULL);",
+                "getname_flags(filename, lookup_flags);",
+            );
+            let _ = fs::write(&patch_path, fixed_content);
+        }
+    }
+
     let fs_source = temp_dir.join(susfs.fs_patch_dir.as_deref().unwrap_or("kernel_patches/fs"));
     let fs_target = find_first_existing_dir(
         kernel_source_path,
