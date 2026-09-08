@@ -1223,6 +1223,22 @@ pub fn handle_build(
     if let Some((url, arg)) = setup_url {
         let cmd = format!("curl -LSs '{}' | bash -s {}", url, arg);
         run_cmd(&["bash", "-c", &cmd], Some(&kernel_source_path), false)?;
+
+        let selinux_hide_c = kernel_source_path.join("KernelSU/kernel/feature/selinux_hide.c");
+        if selinux_hide_c.exists() {
+            if let Ok(content) = fs::read_to_string(&selinux_hide_c) {
+                if content.contains("rwlock_init(&fake_state.ss->policy_rwlock);")
+                    && !content.contains("KERNEL_VERSION(5, 10, 0)")
+                {
+                    let fixed = content.replace(
+                        "rwlock_init(&fake_state.ss->policy_rwlock);",
+                        "#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)\n    rwlock_init(&fake_state.ss->policy_rwlock);\n#endif",
+                    );
+                    let _ = fs::write(&selinux_hide_c, fixed);
+                    println!("Applied fix for policy_rwlock in KernelSU/kernel/feature/selinux_hide.c");
+                }
+            }
+        }
     }
 
     let mut feature_suffixes = Vec::new();
