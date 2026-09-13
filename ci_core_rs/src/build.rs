@@ -773,6 +773,29 @@ fn apply_susfs_overlay(kernel_source_path: &Path, susfs: &SusfsConfig) -> Result
         &["common".to_string(), "kernel_platform/common".to_string()],
     )?;
 
+    let susfs_entries = vec![
+        ("CONFIG_KSU_SUSFS", "y"),
+        ("CONFIG_KSU_SUSFS_SUS_PATH", "y"),
+        ("CONFIG_KSU_SUSFS_SUS_MOUNT", "y"),
+        ("CONFIG_KSU_SUSFS_SUS_KSTAT", "y"),
+        ("CONFIG_KSU_SUSFS_SPOOF_UNAME", "y"),
+        ("CONFIG_KSU_SUSFS_ENABLE_LOG", "y"),
+        ("CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS", "y"),
+        ("CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG", "y"),
+        ("CONFIG_KSU_SUSFS_OPEN_REDIRECT", "y"),
+        ("CONFIG_KSU_SUSFS_SUS_MAP", "y"),
+    ];
+
+    for path in &[
+        kernel_source_path.join("arch/arm64/configs/gki_defconfig"),
+        kernel_source_path.join("common/arch/arm64/configs/gki_defconfig"),
+        kernel_source_path.join("kernel_platform/common/arch/arm64/configs/gki_defconfig"),
+    ] {
+        if path.exists() {
+            let _ = update_kconfig_file(path, &susfs_entries);
+        }
+    }
+
     fs::remove_dir_all(&temp_dir)?;
     Ok(())
 }
@@ -989,6 +1012,16 @@ fn prepare_sm8850_build(
     ];
     if enable_ksu {
         entries.push(("CONFIG_KSU", "y"));
+        entries.push(("CONFIG_KSU_SUSFS", "y"));
+        entries.push(("CONFIG_KSU_SUSFS_SUS_PATH", "y"));
+        entries.push(("CONFIG_KSU_SUSFS_SUS_MOUNT", "y"));
+        entries.push(("CONFIG_KSU_SUSFS_SUS_KSTAT", "y"));
+        entries.push(("CONFIG_KSU_SUSFS_SPOOF_UNAME", "y"));
+        entries.push(("CONFIG_KSU_SUSFS_ENABLE_LOG", "y"));
+        entries.push(("CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS", "y"));
+        entries.push(("CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG", "y"));
+        entries.push(("CONFIG_KSU_SUSFS_OPEN_REDIRECT", "y"));
+        entries.push(("CONFIG_KSU_SUSFS_SUS_MAP", "y"));
     }
     update_kconfig_file(&defconfig_file, &entries)
 }
