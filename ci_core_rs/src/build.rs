@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use chrono::{FixedOffset, Utc};
 use std::collections::HashMap;
 use std::env;
@@ -6,15 +6,40 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use crate::config::{AnyKernelConfig, BbgConfig, ProjectConfig, SusfsConfig};
+use crate::config::{AbiBaseline, AnyKernelConfig, BbgConfig, ProjectConfig, SusfsConfig};
 use crate::utils::{
-    cache_file_name, command_exists, env_flag, file_sha256, handle_notify, is_resukisu_variant,
+    cache_file_name, command_exists, env_flag, file_sha256, handle_notify, is_bakasu_variant,
     load_anykernel_config, load_project, run_cmd, run_cmd_with_env, set_github_output,
     url_file_name, variant_suffix,
 };
 
 const ANYKERNEL_REPO: &str = "https://github.com/YuzakiKokuban/AnyKernel3.git";
 const ANYKERNEL_BRANCH: &str = "master";
+const HYBRIDMOUNT_REPO: &str = "https://github.com/Hybrid-Mount/meta-hybrid_mount.git";
+const HYBRIDMOUNT_BRANCH: &str = "dev";
+/// `build_style` value opting a project into the ACK/GKI-6.12 pipeline.
+const GKI_612_BUILD_STYLE: &str = "gki-6.12";
+/// Soc suffix that historically selected the same pipeline via the project key
+/// (`nezha_sm8850`), kept so that entry needs no config change.
+const GKI_612_LEGACY_SOC: &str = "sm8850";
+
+const GKI_CUSTOM_KCONFIG_ENTRIES: &[(&str, &str)] = &[
+    ("CONFIG_OVERLAY_FS_REDIRECT_DIR", "y"),
+    ("CONFIG_OVERLAY_FS_INDEX", "y"),
+    ("CONFIG_OVERLAY_FS_XINO_AUTO", "y"),
+    ("CONFIG_OVERLAY_FS_METACOPY", "y"),
+    ("CONFIG_OVERLAY_FS_DEBUG", "y"),
+    ("CONFIG_TMPFS_INODE64", "y"),
+    ("CONFIG_TMPFS_QUOTA", "y"),
+];
+const COMMON_KSU_KCONFIG_ENTRIES: &[(&str, &str)] = &[
+    ("CONFIG_KSU", "y"),
+    ("CONFIG_KSU_MULTI_MANAGER_SUPPORT", "y"),
+    (
+        "CONFIG_KSU_FULL_NAME_FORMAT",
+        "\"%TAG_NAME%-%COMMIT_SHA%-BahlilKernel@%REPO_NAME%\"",
+    ),
+];
 
 fn verify_toolchain_checksum(
     url: &str,
@@ -53,6 +78,75 @@ fn toolchain_paths_ready(toolchain_base: &Path, proj: &ProjectConfig) -> bool {
         && toolchain_base.join("bin").exists()
 }
 
+fn download_single_toolchain(
+    url: &str,
+    tc_download_dir: &Path,
+    cache_dir: Option<&Path>,
+    offline: bool,
+    checksums: Option<&HashMap<String, String>>,
+) -> Result<()> {
+    let file_name = url_file_name(url)?;
+    let download_path = tc_download_dir.join(&file_name);
+
+    if let Some(cache_dir) = cache_dir {
+        fs::create_dir_all(cache_dir)?;
+        let cache_path = cache_dir.join(cache_file_name(url)?);
+
+        if cache_path.exists() {
+            verify_toolchain_checksum(url, &cache_path, checksums)?;
+            println!("Using cached toolchain package: {}", file_name);
+            fs::copy(cache_path, download_path)?;
+            return Ok(());
+        }
+
+        if offline {
+            return Err(anyhow!(
+                "Toolchain package is missing from cache while offline: {}",
+                url
+            ));
+        }
+
+        println!("Downloading toolchain from {}...", url);
+        let cache_file_name = cache_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("toolchain");
+        let tmp_path =
+            cache_path.with_file_name(format!("{}.tmp-{}", cache_file_name, std::process::id()));
+        let _ = fs::remove_file(&tmp_path);
+        let tmp_path_str = tmp_path
+            .to_str()
+            .ok_or_else(|| anyhow!("Invalid toolchain cache path"))?;
+        let download_result = (|| {
+            run_cmd(&["wget", "-q", "-O", tmp_path_str, url], None, false)?;
+            verify_toolchain_checksum(url, &tmp_path, checksums)?;
+            fs::rename(&tmp_path, &cache_path)?;
+            Ok(())
+        })();
+        if let Err(err) = download_result {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err);
+        }
+        fs::copy(cache_path, download_path)?;
+    } else {
+        if offline {
+            return Err(anyhow!(
+                "Toolchain cache is disabled and offline mode cannot download: {}",
+                url
+            ));
+        }
+
+        println!("Downloading toolchain from {}...", url);
+        let download_path_str = download_path
+            .to_str()
+            .ok_or_else(|| anyhow!("Invalid toolchain download path"))?;
+        run_cmd(&["wget", "-q", "-O", download_path_str, url], None, false)?;
+        verify_toolchain_checksum(url, &download_path, checksums)?;
+    }
+
+    Ok(())
+}
+
 fn download_toolchains(
     urls: &[String],
     tc_download_dir: &Path,
@@ -65,68 +159,29 @@ fn download_toolchains(
     }
     fs::create_dir_all(tc_download_dir)?;
 
-    for url in urls {
-        let file_name = url_file_name(url)?;
-        let download_path = tc_download_dir.join(&file_name);
+    // Toolchain shards are independent of one another, so download them in parallel
+    // to bound the total download time by the largest single shard.
+    let results: Vec<Result<()>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = urls
+            .iter()
+            .map(|url| {
+                scope.spawn(move || {
+                    download_single_toolchain(url, tc_download_dir, cache_dir, offline, checksums)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| Err(anyhow!("Toolchain download thread panicked")))
+            })
+            .collect()
+    });
 
-        if let Some(cache_dir) = cache_dir {
-            fs::create_dir_all(cache_dir)?;
-            let cache_path = cache_dir.join(cache_file_name(url)?);
-
-            if cache_path.exists() {
-                verify_toolchain_checksum(url, &cache_path, checksums)?;
-                println!("Using cached toolchain package: {}", file_name);
-                fs::copy(cache_path, download_path)?;
-                continue;
-            }
-
-            if offline {
-                return Err(anyhow!(
-                    "Toolchain package is missing from cache while offline: {}",
-                    url
-                ));
-            }
-
-            println!("Downloading toolchain from {}...", url);
-            let cache_file_name = cache_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("toolchain");
-            let tmp_path = cache_path.with_file_name(format!(
-                "{}.tmp-{}",
-                cache_file_name,
-                std::process::id()
-            ));
-            let _ = fs::remove_file(&tmp_path);
-            let tmp_path_str = tmp_path
-                .to_str()
-                .ok_or_else(|| anyhow!("Invalid toolchain cache path"))?;
-            let download_result = (|| {
-                run_cmd(&["wget", "-q", "-O", tmp_path_str, url], None, false)?;
-                verify_toolchain_checksum(url, &tmp_path, checksums)?;
-                fs::rename(&tmp_path, &cache_path)?;
-                Ok(())
-            })();
-            if let Err(err) = download_result {
-                let _ = fs::remove_file(&tmp_path);
-                return Err(err);
-            }
-            fs::copy(cache_path, download_path)?;
-        } else {
-            if offline {
-                return Err(anyhow!(
-                    "Toolchain cache is disabled and offline mode cannot download: {}",
-                    url
-                ));
-            }
-
-            println!("Downloading toolchain from {}...", url);
-            let download_path_str = download_path
-                .to_str()
-                .ok_or_else(|| anyhow!("Invalid toolchain download path"))?;
-            run_cmd(&["wget", "-q", "-O", download_path_str, url], None, false)?;
-            verify_toolchain_checksum(url, &download_path, checksums)?;
-        }
+    for result in results {
+        result?;
     }
 
     Ok(())
@@ -267,6 +322,289 @@ fn copy_artifact_if_exists(source: &Path, artifact_dir: &Path) -> Result<bool> {
         .ok_or_else(|| anyhow!("Artifact path {:?} has no filename", source))?;
     fs::copy(source, artifact_dir.join(file_name))?;
     Ok(true)
+}
+
+/// Read a text file, apply `edit`, and write the result back.
+///
+/// Reading is mandatory: a file that cannot be decoded is reported to the caller instead of
+/// being treated as empty, which previously overwrote real content with a truncated rewrite.
+fn edit_text_file<F>(path: &Path, edit: F) -> Result<()>
+where
+    F: FnOnce(String) -> String,
+{
+    let content = fs::read_to_string(path)?;
+    fs::write(path, edit(content))?;
+    Ok(())
+}
+
+/// Read a file for inspection, treating a genuinely missing file as empty.
+///
+/// Unlike `unwrap_or_default()`, any other failure (permissions, invalid UTF-8) is reported
+/// instead of silently making the file look empty.
+fn read_text_allow_missing(path: &Path) -> Result<String> {
+    match fs::read_to_string(path) {
+        Ok(content) => Ok(content),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(err) => Err(anyhow!("Failed to read {}: {}", path.display(), err)),
+    }
+}
+
+/// Download a setup script and pipe it into bash.
+///
+/// `pipefail` and `curl -f` are both required: without them a failed download yields an empty
+/// script that bash happily "runs", so the overlay is silently skipped and the build still
+/// succeeds while shipping a kernel with the feature it was supposed to add.
+///
+/// The URL and the setup argument are passed through the environment and referenced as quoted
+/// shell variables rather than being formatted into the command text, so neither can inject
+/// shell syntax (the setup argument is a free-form workflow input).
+fn copy_dir_files(source: &Path, dest: &Path) -> Result<()> {
+    if !source.is_dir() {
+        return Err(anyhow!("Source directory not found: {:?}", source));
+    }
+    fs::create_dir_all(dest)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file() {
+            let file_name = path
+                .file_name()
+                .ok_or_else(|| anyhow!("Invalid file path: {:?}", path))?;
+            fs::copy(&path, dest.join(file_name))?;
+        }
+    }
+    Ok(())
+}
+
+fn stage_patch_in_cwd(patch_file: &Path, cwd: &Path) -> Result<PathBuf> {
+    let file_name = patch_file
+        .file_name()
+        .ok_or_else(|| anyhow!("Invalid patch file path: {:?}", patch_file))?;
+    let staged_patch = cwd.join(file_name);
+    fs::copy(patch_file, &staged_patch)?;
+    Ok(staged_patch)
+}
+
+fn cleanup_staged_patch(staged_patch: &Path, original_patch: &Path) {
+    if staged_patch != original_patch {
+        let _ = fs::remove_file(staged_patch);
+    }
+}
+
+fn run_patch_command(patch_file: &Path, cwd: &Path, dry_run: bool) -> Result<bool> {
+    let staged_patch = stage_patch_in_cwd(patch_file, cwd)?;
+    let result = (|| {
+        let patch_name = staged_patch
+            .file_name()
+            .ok_or_else(|| anyhow!("Invalid staged patch path: {:?}", staged_patch))?;
+        let mut command = std::process::Command::new("patch");
+        command.arg("-p1").arg("-N").arg("-F").arg("3");
+        if dry_run {
+            command.arg("--dry-run");
+        }
+        let status = command
+            .arg("-i")
+            .arg(patch_name)
+            .current_dir(cwd)
+            .status()?;
+        Ok(status.success())
+    })();
+    cleanup_staged_patch(&staged_patch, patch_file);
+    result
+}
+
+fn can_apply_patch(patch_file: &Path, cwd: &Path) -> Result<bool> {
+    run_patch_command(patch_file, cwd, true)
+}
+fn run_patch(patch_file: &Path, cwd: &Path) -> Result<bool> {
+    run_patch_command(patch_file, cwd, false)
+}
+fn apply_patch_once(patch_file: &Path, cwd: &Path) -> Result<bool> {
+    if can_apply_patch(patch_file, cwd)? {
+        return run_patch(patch_file, cwd);
+    }
+    Ok(false)
+}
+fn apply_patch_with_fallbacks(
+    patch_file: &Path,
+    kernel_source_path: &Path,
+    fallback_dirs: &[String],
+) -> Result<()> {
+    if apply_patch_once(patch_file, kernel_source_path)? {
+        return Ok(());
+    }
+    for fallback in fallback_dirs {
+        let cwd = kernel_source_path.join(fallback);
+        if cwd.is_dir() && apply_patch_once(patch_file, &cwd)? {
+            return Ok(());
+        }
+    }
+    Err(anyhow!("Failed to apply patch {:?}", patch_file))
+}
+
+/// The upstream SuSFS patch targets vanilla GKI task_mmu.c. On kernels where
+/// show_smap()/show_smaps_rollup() diverge (e.g. vma_pages() instead of
+/// vma_data_pages(), rewritten rollup loop), GNU patch with fuzz 3 silently
+/// lands three SUS_MAP hunks in wrong functions (smaps_rollup_open and
+/// pte_is_pinned), which then fails to compile ('vma' undeclared).
+/// Detect those exact misplacements and re-apply the intent at the correct
+/// anchors. No-op when the patch already applied cleanly; hard error when a
+/// known misplacement is present but an anchor is missing, so we never ship
+/// a silently broken patch.
+fn fix_susfs_task_mmu(kernel_source_path: &Path) -> Result<()> {
+    let path = find_first_existing_dir(
+        kernel_source_path,
+        &[
+            "common/fs/proc".to_string(),
+            "kernel_platform/common/fs/proc".to_string(),
+            "fs/proc".to_string(),
+        ],
+    )
+    .map(|d| d.join("task_mmu.c"))
+    .filter(|p| p.exists());
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let mut content = fs::read_to_string(&path)?;
+    let bad_a = "\tint ret;\n#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n\tif (vma->vm_file) {\n\t\tif (SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))\n\t\t\treturn 0;\n\t}\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n\n";
+    if content.contains(bad_a) {
+        content = content.replacen(bad_a, "\tint ret;\n", 1);
+        let anchor = "\tstruct mem_size_stats mss = {};\n\n\tif (!vma_pages(vma))";
+        let fixed = "\tstruct mem_size_stats mss = {};\n\n#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n\tif (vma->vm_file) {\n\t\tif (SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))\n\t\t\treturn 0;\n\t}\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n\n\tif (!vma_pages(vma))";
+        if !content.contains(anchor) {
+            return Err(anyhow!(
+                "SuSFS task_mmu fix: show_smap anchor not found in {:?}",
+                path
+            ));
+        }
+        content = content.replacen(anchor, fixed, 1);
+        println!("Fixed misplaced SuSFS show_smap hunk in task_mmu.c");
+    }
+    let bad_b = "{\n#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n\t\tif (vma->vm_file && SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))\n\t\t\tgoto bypass_orig_flow;\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n\n\tstruct folio *folio;";
+    let bad_c = "\treturn folio_maybe_dma_pinned(folio);\n#ifdef CONFIG_KSU_SUSFS_SUS_MAP\nbypass_orig_flow:\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n}";
+    if content.contains(bad_b) || content.contains(bad_c) {
+        content = content.replacen(bad_b, "{\n\tstruct folio *folio;", 1);
+        content = content.replacen(bad_c, "\treturn folio_maybe_dma_pinned(folio);\n}", 1);
+        let gather = "\t\tsmap_gather_stats(vma, &mss, 0);\n\t\tlast_vma_end = vma->vm_end;";
+        let fixed_gather = "#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n\t\tif (!vma->vm_file || !SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n\t\t\tsmap_gather_stats(vma, &mss, 0);\n\t\tlast_vma_end = vma->vm_end;";
+        if !content.contains(gather) {
+            return Err(anyhow!(
+                "SuSFS task_mmu fix: show_smaps_rollup anchor not found in {:?}",
+                path
+            ));
+        }
+        content = content.replacen(gather, fixed_gather, 1);
+        println!("Fixed misplaced SuSFS show_smaps_rollup hunk in task_mmu.c");
+    }
+    fs::write(&path, content)?;
+    Ok(())
+}
+
+fn apply_susfs_overlay(
+    kernel_source_path: &Path,
+    defconfig_name: &str,
+    susfs: &SusfsConfig,
+) -> Result<()> {
+    let temp_dir = kernel_source_path.join(".susfs_workspace");
+    if temp_dir.exists() {
+        fs::remove_dir_all(&temp_dir)?;
+    }
+    let clone_result = run_cmd(
+        &[
+            "git",
+            "clone",
+            "--depth=1",
+            "--branch",
+            &susfs.branch,
+            &susfs.repo,
+            temp_dir
+                .to_str()
+                .ok_or_else(|| anyhow!("Invalid temp path"))?,
+        ],
+        None,
+        false,
+    );
+    let result = (|| {
+        clone_result?;
+        let patch_path = temp_dir.join(&susfs.patch_path);
+        if !patch_path.exists() {
+            return Err(anyhow!("SuSFS patch not found: {:?}", patch_path));
+        }
+        if let Ok(content) = fs::read_to_string(&patch_path)
+            && content.contains("getname_flags(filename, lookup_flags, NULL);")
+        {
+            let fixed = content.replace(
+                "getname_flags(filename, lookup_flags, NULL);",
+                "getname_flags(filename, lookup_flags);",
+            );
+            let _ = fs::write(&patch_path, fixed);
+        }
+        let fs_source = temp_dir.join(susfs.fs_patch_dir.as_deref().unwrap_or("kernel_patches/fs"));
+        let fs_target = find_first_existing_dir(
+            kernel_source_path,
+            &[
+                "common/fs".to_string(),
+                "kernel_platform/common/fs".to_string(),
+                "fs".to_string(),
+            ],
+        )
+        .ok_or_else(|| anyhow!("Could not locate kernel fs directory for SuSFS"))?;
+        copy_dir_files(&fs_source, &fs_target)?;
+        let include_source = temp_dir.join(
+            susfs
+                .include_linux_patch_dir
+                .as_deref()
+                .unwrap_or("kernel_patches/include/linux"),
+        );
+        let include_target = find_first_existing_dir(
+            kernel_source_path,
+            &[
+                "common/include/linux".to_string(),
+                "kernel_platform/common/include/linux".to_string(),
+                "include/linux".to_string(),
+            ],
+        )
+        .ok_or_else(|| anyhow!("Could not locate kernel include/linux directory for SuSFS"))?;
+        copy_dir_files(&include_source, &include_target)?;
+        apply_patch_with_fallbacks(
+            &patch_path,
+            kernel_source_path,
+            &["common".to_string(), "kernel_platform/common".to_string()],
+        )?;
+        fix_susfs_task_mmu(kernel_source_path)?;
+        let entries = [
+            ("CONFIG_KSU_SUSFS", "y"),
+            ("CONFIG_KSU_SUSFS_SUS_PATH", "y"),
+            ("CONFIG_KSU_SUSFS_SUS_MOUNT", "y"),
+            ("CONFIG_KSU_SUSFS_SUS_KSTAT", "y"),
+            ("CONFIG_KSU_SUSFS_SPOOF_UNAME", "y"),
+            ("CONFIG_KSU_SUSFS_ENABLE_LOG", "y"),
+            ("CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS", "y"),
+            ("CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG", "y"),
+            ("CONFIG_KSU_SUSFS_OPEN_REDIRECT", "y"),
+            ("CONFIG_KSU_SUSFS_SUS_MAP", "y"),
+        ];
+        update_kconfig_file(
+            &project_defconfig_path(kernel_source_path, defconfig_name)?,
+            &entries,
+        )?;
+        Ok(())
+    })();
+    let _ = fs::remove_dir_all(&temp_dir);
+    result
+}
+
+fn run_setup_script(url: &str, setup_arg: Option<&str>, cwd: &Path) -> Result<()> {
+    let mut envs = HashMap::new();
+    envs.insert("KOKUBAN_SETUP_URL".to_string(), url.to_string());
+
+    let mut cmd = String::from("set -o pipefail; curl -fsSL \"$KOKUBAN_SETUP_URL\" | bash");
+    if let Some(arg) = setup_arg {
+        envs.insert("KOKUBAN_SETUP_ARG".to_string(), arg.to_string());
+        cmd.push_str(" -s \"$KOKUBAN_SETUP_ARG\"");
+    }
+
+    run_cmd_with_env(&["bash", "-c", &cmd], Some(cwd), &envs)
 }
 
 fn upsert_kconfig_entry(content: &str, key: &str, value: &str) -> String {
@@ -503,6 +841,26 @@ fn apply_anykernel_config(anykernel_dir: &Path, config: &AnyKernelConfig) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disabled_config_validation_accepts_kconfig_not_set_syntax() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("pixel4-disabled-config-{unique}"));
+        fs::write(
+            &path,
+            "# CONFIG_TEST_DISABLED is not set\nCONFIG_HYBRIDMOUNT=y\n",
+        )
+        .unwrap();
+        let required = &[("CONFIG_TEST_DISABLED", "n"), ("CONFIG_HYBRIDMOUNT", "y")];
+        assert!(validate_kconfig_entries(&path, required).is_ok());
+        fs::write(&path, "CONFIG_TEST_DISABLED=y\nCONFIG_HYBRIDMOUNT=y\n").unwrap();
+        assert!(validate_kconfig_entries(&path, required).is_err());
+        fs::remove_file(path).unwrap();
+    }
+
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -574,165 +932,745 @@ write_boot; # use flash_boot to skip ramdisk repack, e.g. for devices with init_
 
         fs::remove_dir_all(&temp_dir).unwrap();
     }
-}
 
-fn copy_dir_files(source: &Path, dest: &Path) -> Result<()> {
-    if !source.is_dir() {
-        return Err(anyhow!("Source directory not found: {:?}", source));
+    #[test]
+    fn rejects_unsupported_bbg_request() {
+        let error = require_bbg_config("nezha_sm8850", None).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Project nezha_sm8850 does not support Baseband Guard"
+        );
     }
 
-    fs::create_dir_all(dest)?;
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_file() {
-            let file_name = path
-                .file_name()
-                .ok_or_else(|| anyhow!("Invalid file path: {:?}", path))?;
-            fs::copy(&path, dest.join(file_name))?;
+    #[test]
+    fn rejects_unexpected_kernel_version() {
+        let error =
+            validate_kernel_version("nezha_sm8850", Some("6.12.69"), "6.12.68").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Project nezha_sm8850 requires kernel 6.12.69, but the source reports 6.12.68"
+        );
+    }
+
+    #[test]
+    fn extracts_make_value_after_setup_diagnostics() {
+        let output =
+            "start setup local env\nROOT_DIR=/tmp/kernel\nend of setup local env\n6.12.69\n";
+
+        assert_eq!(last_nonempty_output_line(output), Some("6.12.69"));
+    }
+
+    #[test]
+    fn keeps_existing_hybridmount_and_enables_config() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("hybridmount-config-test-{unique}"));
+        fs::create_dir_all(temp_dir.join("fs/hybridmount")).unwrap();
+        fs::create_dir_all(temp_dir.join("arch/arm64/configs")).unwrap();
+        fs::write(temp_dir.join("fs/Kconfig"), "menu \"File systems\"\n").unwrap();
+        fs::write(temp_dir.join("arch/arm64/configs/test_defconfig"), "").unwrap();
+
+        apply_hybridmount_overlay(&temp_dir, "test_defconfig").unwrap();
+        let config =
+            fs::read_to_string(temp_dir.join("arch/arm64/configs/test_defconfig")).unwrap();
+
+        assert_eq!(config, "CONFIG_HYBRIDMOUNT=y\n");
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    // The setup script runs with the kernel source root as its working directory, so it has
+    // to be addressed absolutely. The earlier relative form broke every Hybrid Mount build
+    // with "setup.sh: No such file", because the path was resolved against that directory.
+    #[test]
+    fn resolves_hybridmount_setup_script_absolutely() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        // A relative workspace root on purpose: test binaries run with the package directory
+        // as their working directory, which is what makes the regression observable.
+        let temp_dir = PathBuf::from(format!("target/hybridmount-script-test-{unique}"));
+        fs::create_dir_all(temp_dir.join("module/vfs")).unwrap();
+        fs::write(temp_dir.join("module/vfs/setup.sh"), "#!/bin/sh\n").unwrap();
+
+        let setup_script = hybridmount_setup_script(&temp_dir).unwrap();
+
+        assert!(
+            setup_script.is_absolute(),
+            "setup script path must be absolute, got {}",
+            setup_script.display()
+        );
+        assert!(setup_script.ends_with("module/vfs/setup.sh"));
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn rejects_hybridmount_when_nomount_exists() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("hybridmount-nomount-test-{unique}"));
+        fs::create_dir_all(temp_dir.join("fs/nomount")).unwrap();
+        fs::write(temp_dir.join("fs/Kconfig"), "menu \"File systems\"\n").unwrap();
+
+        let error = apply_hybridmount_overlay(&temp_dir, "test_defconfig").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Hybrid Mount cannot be enabled because this kernel already integrates NoMount"
+        );
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    // A defconfig that lives under common/ (rather than arch/arm64/configs/) must still
+    // receive the localversion, otherwise the build silently ships a different version string.
+    #[test]
+    fn applies_gki_localversion_to_nested_defconfig() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("sm8850-localversion-test-{unique}"));
+        fs::create_dir_all(temp_dir.join("common/arch/arm64/configs")).unwrap();
+        fs::write(
+            temp_dir.join("common/arch/arm64/configs/test_defconfig"),
+            "CONFIG_LOCALVERSION=\"-old\"\n",
+        )
+        .unwrap();
+
+        apply_gki_localversion(&temp_dir, "test_defconfig", "-new").unwrap();
+
+        let config =
+            fs::read_to_string(temp_dir.join("common/arch/arm64/configs/test_defconfig")).unwrap();
+        assert!(
+            config.contains("CONFIG_LOCALVERSION=\"-new\""),
+            "got: {config}"
+        );
+        assert!(
+            config.contains("CONFIG_LOCALVERSION_AUTO=n"),
+            "got: {config}"
+        );
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    fn project_with_build_style(repo: &str, build_style: Option<&str>) -> ProjectConfig {
+        ProjectConfig {
+            repo: repo.to_string(),
+            defconfig: "defconfig".to_string(),
+            localversion_base: "-test".to_string(),
+            expected_kernel_version: None,
+            lto: None,
+            supported_ksu: None,
+            toolchain_urls: None,
+            toolchain_sha256: None,
+            toolchain_path_prefix: None,
+            toolchain_path_exports: None,
+            anykernel_config: None,
+            zip_name_prefix: None,
+            version_method: None,
+            build_style: build_style.map(str::to_string),
+            abi_symbol_gates: None,
+            kconfig_fragment: None,
+            abi_baseline: None,
+            extra_host_env: None,
+            disable_security: None,
+            readme_placeholders: None,
+            susfs: None,
+            bbg: None,
+            watch_upstream_variants: None,
         }
     }
 
+    // nezha_sm8850 predates `build_style`; its soc suffix must keep selecting the GKI
+    // pipeline, while a new device opts in explicitly.
+    #[test]
+    fn selects_gki_pipeline_by_legacy_soc_or_build_style() {
+        assert!(uses_gki_612_pipeline(
+            "nezha_sm8850",
+            &project_with_build_style("yuzaki/x", None)
+        ));
+        assert!(uses_gki_612_pipeline(
+            "razrfold_sm8845",
+            &project_with_build_style("yuzaki/blanc", Some("gki-6.12"))
+        ));
+        assert!(!uses_gki_612_pipeline(
+            "s23_sm8550",
+            &project_with_build_style("yuzaki/s23", None)
+        ));
+        assert!(!uses_gki_612_pipeline(
+            "razrfold_sm8845",
+            &project_with_build_style("yuzaki/blanc", Some("make"))
+        ));
+    }
+
+    #[test]
+    fn parses_symvers_lines_and_skips_malformed_ones() {
+        assert_eq!(
+            parse_symvers_line("0xf54e5881\tvendor_data_pad\tvmlinux\tEXPORT_SYMBOL_GPL\t"),
+            Some(("0xf54e5881".to_string(), "vendor_data_pad".to_string()))
+        );
+        assert_eq!(parse_symvers_line(""), None);
+        assert_eq!(parse_symvers_line("\t\t\t"), None);
+    }
+
+    fn kernel_source_with_symvers(name: &str, symvers: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("{name}-{unique}"));
+        fs::create_dir_all(temp_dir.join("out")).unwrap();
+        fs::write(temp_dir.join("out/Module.symvers"), symvers).unwrap();
+        temp_dir
+    }
+
+    fn vendor_data_pad_gate() -> HashMap<String, String> {
+        HashMap::from([("vendor_data_pad".to_string(), "0xf54e5881".to_string())])
+    }
+
+    #[test]
+    fn abi_gate_accepts_the_stock_vendor_data_pad_crc() {
+        let dir = kernel_source_with_symvers(
+            "abi-gate-ok",
+            "0xf54e5881\tvendor_data_pad\tvmlinux\tEXPORT_SYMBOL_GPL\t\n",
+        );
+        assert!(verify_abi_symbol_gates(&dir, &vendor_data_pad_gate()).is_ok());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    // Forcing GKI_TASK_STRUCT_VENDOR_SIZE_MAX to 1024 is the documented cause of the
+    // blanc bootloop; the gate must stop that image from being packaged.
+    #[test]
+    fn abi_gate_rejects_the_vendor_size_1024_crc() {
+        let dir = kernel_source_with_symvers(
+            "abi-gate-mismatch",
+            "0xa4519653\tvendor_data_pad\tvmlinux\tEXPORT_SYMBOL_GPL\t\n",
+        );
+        let error = verify_abi_symbol_gates(&dir, &vendor_data_pad_gate()).unwrap_err();
+        assert!(error.to_string().contains("0xa4519653"), "got: {error}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn abi_gate_rejects_a_symbol_the_build_never_exported() {
+        let dir = kernel_source_with_symvers(
+            "abi-gate-missing",
+            "0x1\tmodule_layout\tvmlinux\tEXPORT_SYMBOL\t\n",
+        );
+        let error = verify_abi_symbol_gates(&dir, &vendor_data_pad_gate()).unwrap_err();
+        assert!(error.to_string().contains("not exported"), "got: {error}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn abi_gate_requires_a_symvers_file_only_when_gates_exist() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("abi-gate-absent-{unique}"));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        assert!(verify_abi_symbol_gates(&temp_dir, &HashMap::new()).is_ok());
+        assert!(verify_abi_symbol_gates(&temp_dir, &vendor_data_pad_gate()).is_err());
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    // `make Image` may stop at vmlinux.symvers; the gate must still find the symbol
+    // rather than reporting the whole ABI unverifiable.
+    #[test]
+    fn abi_gate_reads_vmlinux_symvers_when_module_symvers_is_absent() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("abi-gate-vmlinux-{unique}"));
+        fs::create_dir_all(temp_dir.join("out")).unwrap();
+        fs::write(
+            temp_dir.join("out/vmlinux.symvers"),
+            "0xf54e5881\tvendor_data_pad\tvmlinux\tEXPORT_SYMBOL_GPL\t\n",
+        )
+        .unwrap();
+
+        assert!(verify_abi_symbol_gates(&temp_dir, &vendor_data_pad_gate()).is_ok());
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn parses_a_tuning_fragment_and_keeps_quoted_values() {
+        let entries = parse_kconfig_fragment(
+            "# a comment\n\nCONFIG_TCP_CONG_BBR=y\nCONFIG_DEFAULT_TCP_CONG=\"cubic\"\n",
+            Path::new("tuning.fragment"),
+        )
+        .unwrap();
+        assert_eq!(
+            entries,
+            vec![
+                ("CONFIG_TCP_CONG_BBR".to_string(), "y".to_string()),
+                (
+                    "CONFIG_DEFAULT_TCP_CONG".to_string(),
+                    "\"cubic\"".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_a_malformed_tuning_fragment() {
+        assert!(parse_kconfig_fragment("CONFIG_FOO\n", Path::new("f")).is_err());
+        assert!(parse_kconfig_fragment("NOT_A_CONFIG=y\n", Path::new("f")).is_err());
+    }
+
+    // The fragment must override whatever the full defconfig already said, including a
+    // `# CONFIG_x is not set` line, or the tuning silently does not take effect.
+    #[test]
+    fn overlays_a_tuning_fragment_onto_the_defconfig() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("kconfig-fragment-{unique}"));
+        fs::create_dir_all(temp_dir.join("arch/arm64/configs")).unwrap();
+        fs::create_dir_all(temp_dir.join("Kokuban")).unwrap();
+        fs::write(
+            temp_dir.join("arch/arm64/configs/test_defconfig"),
+            "# CONFIG_TCP_CONG_ADVANCED is not set\nCONFIG_DEFAULT_TCP_CONG=\"cubic\"\n",
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.join("Kokuban/tuning.fragment"),
+            "# comment\nCONFIG_TCP_CONG_ADVANCED=y\nCONFIG_TCP_CONG_BBR=y\n",
+        )
+        .unwrap();
+
+        apply_kconfig_fragment(&temp_dir, "test_defconfig", "Kokuban/tuning.fragment").unwrap();
+
+        let config =
+            fs::read_to_string(temp_dir.join("arch/arm64/configs/test_defconfig")).unwrap();
+        assert!(
+            config.starts_with("CONFIG_TCP_CONG_ADVANCED=y\n"),
+            "{config}"
+        );
+        assert!(config.contains("CONFIG_TCP_CONG_BBR=y"), "{config}");
+        assert!(!config.contains("is not set\n"), "{config}");
+        // An untouched entry keeps its original position and value.
+        assert!(
+            config.contains("CONFIG_DEFAULT_TCP_CONG=\"cubic\""),
+            "{config}"
+        );
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn reports_a_missing_tuning_fragment() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("kconfig-fragment-missing-{unique}"));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let error = apply_kconfig_fragment(&temp_dir, "test_defconfig", "Kokuban/tuning.fragment")
+            .unwrap_err();
+        assert!(error.to_string().contains("tuning.fragment"), "{error}");
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    fn symvers(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(symbol, crc)| (symbol.to_string(), crc.to_string()))
+            .collect()
+    }
+
+    fn rust_ignore() -> Vec<String> {
+        vec!["_R".to_string()]
+    }
+
+    #[test]
+    fn fragment_source_includes_are_resolved_and_later_entries_win() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("fragment-include-{unique}"));
+        fs::create_dir_all(dir.join("tuning")).unwrap();
+        fs::write(
+            dir.join("tuning.fragment"),
+            "CONFIG_A=y\nsource tuning/network.fragment\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("tuning/network.fragment"),
+            "CONFIG_A=n\nCONFIG_NET_SCH_CAKE=y\n",
+        )
+        .unwrap();
+
+        let entries = parse_kconfig_fragment(
+            &fs::read_to_string(dir.join("tuning.fragment")).unwrap(),
+            &dir.join("tuning.fragment"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            entries,
+            vec![
+                ("CONFIG_A".to_string(), "y".to_string()),
+                ("CONFIG_A".to_string(), "n".to_string()),
+                ("CONFIG_NET_SCH_CAKE".to_string(), "y".to_string()),
+            ]
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn fragment_source_cycles_are_rejected() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("fragment-cycle-{unique}"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a.fragment"), "source b.fragment\n").unwrap();
+        fs::write(dir.join("b.fragment"), "source a.fragment\n").unwrap();
+
+        let error = parse_kconfig_fragment(
+            &fs::read_to_string(dir.join("a.fragment")).unwrap(),
+            &dir.join("a.fragment"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cycle"), "{error}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn abi_diff_classifies_mismatch_missing_and_extra() {
+        let baseline = symvers(&[
+            ("module_layout", "0xaaa"),
+            ("vendor_data_pad", "0xbbb"),
+            ("gone", "0xccc"),
+            ("_RNvRust", "0xddd"),
+        ]);
+        let built = symvers(&[
+            ("module_layout", "0xaaa"),
+            ("vendor_data_pad", "0xzzz"),
+            ("_RNvRust", "0xeee"),
+            ("brand_new", "0x123"),
+        ]);
+
+        let report = diff_symvers(&built, &baseline, &rust_ignore());
+
+        assert_eq!(report.compared, 3, "Rust-mangled names are not compared");
+        assert_eq!(
+            report.crc_mismatch,
+            vec![(
+                "vendor_data_pad".to_string(),
+                "0xbbb".to_string(),
+                "0xzzz".to_string()
+            )]
+        );
+        assert_eq!(report.missing, vec!["gone".to_string()]);
+        assert_eq!(report.extra, vec!["brand_new".to_string()]);
+    }
+
+    fn baseline_file(dir: &Path, content: &str) {
+        fs::create_dir_all(dir.join("Kokuban/abi")).unwrap();
+        fs::write(dir.join("Kokuban/abi/golden.symvers"), content).unwrap();
+    }
+
+    fn baseline_config(allow_crc_mismatch: usize, allow_missing: usize) -> AbiBaseline {
+        AbiBaseline {
+            path: "Kokuban/abi/golden.symvers".to_string(),
+            ignore_prefixes: rust_ignore(),
+            allow_crc_mismatch,
+            allow_missing,
+            allowed_missing_symbols: Vec::new(),
+            allowed_crc_symbols: Vec::new(),
+            consumer_manifest: None,
+        }
+    }
+
+    // Disabling a debug feature necessarily drops its debug symbols, so the gate
+    // accepts a *named* list of them instead of a fuzzy count.
+    #[test]
+    fn abi_baseline_accepts_named_symbol_exceptions() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("abi-baseline-named-{unique}"));
+        baseline_file(
+            &dir,
+            "0xaaa	module_layout	vmlinux	EXPORT_SYMBOL	\n0xbbb	kasan_mode	vmlinux	EXPORT_SYMBOL_GPL	\n",
+        );
+        fs::create_dir_all(dir.join("out")).unwrap();
+        fs::write(
+            dir.join("out/vmlinux.symvers"),
+            "0xccc	module_layout	vmlinux	EXPORT_SYMBOL	\n",
+        )
+        .unwrap();
+
+        let mut config = baseline_config(0, 0);
+        assert!(
+            verify_abi_baseline(&dir, &config).is_err(),
+            "both deltas fail"
+        );
+
+        config.allowed_missing_symbols = vec!["kasan_mode".to_string()];
+        config.allowed_crc_symbols = vec!["module_layout".to_string()];
+        assert!(
+            verify_abi_baseline(&dir, &config).is_ok(),
+            "named exceptions clear both"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn abi_baseline_passes_when_the_symbol_table_is_unmoved() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("abi-baseline-ok-{unique}"));
+        let golden = "0xaaa\tmodule_layout\tvmlinux\tEXPORT_SYMBOL\t\n";
+        baseline_file(&dir, golden);
+        fs::create_dir_all(dir.join("out")).unwrap();
+        fs::write(dir.join("out/vmlinux.symvers"), golden).unwrap();
+
+        assert!(verify_abi_baseline(&dir, &baseline_config(0, 0)).is_ok());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    // An experiment that moves an exported symbol must fail loudly, not ship.
+    #[test]
+    fn reports_fragment_entries_the_resolved_config_dropped() {
+        let requested = vec![
+            ("CONFIG_KASAN".to_string(), "n".to_string()),
+            ("CONFIG_HZ".to_string(), "300".to_string()),
+            ("CONFIG_NET_SCH_CAKE".to_string(), "y".to_string()),
+        ];
+        // KASAN off is expressed as an absent symbol; HZ was recomputed to 250.
+        let config = "CONFIG_HZ=250\nCONFIG_NET_SCH_CAKE=y\n";
+
+        let dropped = unapplied_fragment_entries(config, &requested);
+
+        assert_eq!(dropped, vec![("CONFIG_HZ".to_string(), "300".to_string())]);
+    }
+
+    #[test]
+    fn abi_baseline_fails_on_a_moved_symbol() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("abi-baseline-moved-{unique}"));
+        baseline_file(&dir, "0xaaa\tmodule_layout\tvmlinux\tEXPORT_SYMBOL\t\n");
+        fs::create_dir_all(dir.join("out")).unwrap();
+        fs::write(
+            dir.join("out/vmlinux.symvers"),
+            "0xbbb\tmodule_layout\tvmlinux\tEXPORT_SYMBOL\t\n",
+        )
+        .unwrap();
+
+        let error = verify_abi_baseline(&dir, &baseline_config(0, 0)).unwrap_err();
+        assert!(error.to_string().contains("changed CRC"), "{error}");
+        // Raising the tolerance is how an experiment records a known, accepted move.
+        assert!(verify_abi_baseline(&dir, &baseline_config(1, 0)).is_ok());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    // The baseline gate compares against a reference build of this same tree, so a
+    // change that is internally consistent satisfies it -- the vendored LZ4 stack
+    // did exactly that. This gate encodes the other half: what the modules already
+    // on the device demand, read out of their own __versions sections.
+    #[test]
+    fn stock_module_abi_catches_a_crc_the_vendor_modules_would_reject() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("stock-module-abi-{unique}"));
+        fs::create_dir_all(dir.join("Kokuban/abi")).unwrap();
+        fs::write(
+            dir.join("Kokuban/abi/stock_module_imports.tsv"),
+            concat!(
+                "# crc\tsymbol\tprovider\timporters\texamples\n",
+                "0xaaa\tLZ4_compress_HC\tvmlinux\t1\tmoto_swap5.ko\n",
+                "0xbbb\tqcom_glink_smem_start\tmodule\t1\tqcom_glink_smem.ko\n",
+                "0xccc\tqcom_smem_get\tunknown\t45\tcnss2.ko\n",
+            ),
+        )
+        .unwrap();
+        fs::create_dir_all(dir.join("out")).unwrap();
+        fs::write(
+            dir.join("out/vmlinux.symvers"),
+            "0xaaa\tLZ4_compress_HC\tvmlinux\tEXPORT_SYMBOL\t\n",
+        )
+        .unwrap();
+
+        let mut config = baseline_config(0, 0);
+        config.consumer_manifest = Some("Kokuban/abi/stock_module_imports.tsv".to_string());
+
+        // Only the `vmlinux` row is ours to keep: what another module provides, or
+        // nobody provides, is not this kernel's contract.
+        assert!(verify_stock_module_abi(&dir, &config).is_ok());
+
+        fs::write(
+            dir.join("out/vmlinux.symvers"),
+            "0xddd\tLZ4_compress_HC\tvmlinux\tEXPORT_SYMBOL\t\n",
+        )
+        .unwrap();
+        let error = verify_stock_module_abi(&dir, &config).unwrap_err();
+        assert!(error.to_string().contains("refuse to load"), "{error}");
+
+        // Dropping the symbol is as fatal as moving it.
+        fs::write(dir.join("out/vmlinux.symvers"), "").unwrap();
+        let error = verify_stock_module_abi(&dir, &config).unwrap_err();
+        assert!(error.to_string().contains("no longer exported"), "{error}");
+
+        // Naming the symbol is how a deliberate move gets recorded.
+        fs::write(
+            dir.join("out/vmlinux.symvers"),
+            "0xddd\tLZ4_compress_HC\tvmlinux\tEXPORT_SYMBOL\t\n",
+        )
+        .unwrap();
+        config.allowed_crc_symbols = vec!["LZ4_compress_HC".to_string()];
+        assert!(verify_stock_module_abi(&dir, &config).is_ok());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    // A file that exists but cannot be decoded must not be silently replaced with a
+    // rewritten empty buffer; the build has to fail so the caller can see it.
+    #[test]
+    fn refuses_to_rewrite_unreadable_file() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("unreadable-file-test-{unique}"));
+        fs::create_dir_all(temp_dir.join("scripts")).unwrap();
+        let target = temp_dir.join("scripts/setlocalversion");
+        let original = vec![0xFF_u8, 0xFE, 0x00];
+        fs::write(&target, &original).unwrap();
+
+        let result = patch_setlocalversion_remove_dirty(&temp_dir);
+
+        assert!(
+            result.is_err(),
+            "expected an error for a file that cannot be read"
+        );
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            original,
+            "the original file must be left untouched"
+        );
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    // A failed download must surface as an error. Without pipefail the pipeline's exit code
+    // comes from bash alone, so an empty/absent script "succeeds" and the overlay is skipped.
+    #[test]
+    fn setup_script_download_failure_is_reported() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("setup-script-test-{unique}"));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let missing = temp_dir.join("does-not-exist.sh");
+        let url = format!("file://{}", missing.display());
+        let result = run_setup_script(&url, None, &temp_dir);
+
+        assert!(
+            result.is_err(),
+            "a download that fails must not be treated as success"
+        );
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    // The setup argument is appended to the bash invocation, so a successful download must
+    // still reach bash as an argument rather than being folded into the curl command.
+    #[test]
+    fn setup_script_passes_argument_to_bash() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("setup-arg-test-{unique}"));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let script = temp_dir.join("setup.sh");
+        fs::write(&script, "echo \"ARG=$1\" > got_arg.txt\n").unwrap();
+        let url = format!("file://{}", script.display());
+
+        run_setup_script(&url, Some("main"), &temp_dir).unwrap();
+
+        let got = fs::read_to_string(temp_dir.join("got_arg.txt")).unwrap();
+        assert_eq!(got.trim(), "ARG=main");
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    // The setup argument comes straight from a free-form workflow input, so shell
+    // metacharacters in it must reach bash as literal text, never as syntax.
+    #[test]
+    fn setup_script_argument_cannot_inject_shell() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("setup-inject-test-{unique}"));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let script = temp_dir.join("setup.sh");
+        fs::write(&script, "echo \"ARG=$1\" > got_arg.txt\n").unwrap();
+        let url = format!("file://{}", script.display());
+
+        // If this were concatenated into the command line, the `; touch pwned` would run.
+        run_setup_script(&url, Some("x; touch pwned"), &temp_dir).unwrap();
+
+        assert!(
+            !temp_dir.join("pwned").exists(),
+            "shell metacharacters in the setup argument must not be executed"
+        );
+        let got = fs::read_to_string(temp_dir.join("got_arg.txt")).unwrap();
+        assert_eq!(
+            got.trim(),
+            "ARG=x; touch pwned",
+            "the argument must arrive as one literal value"
+        );
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+}
+
+fn require_bbg_config<'a>(project_key: &str, bbg: Option<&'a BbgConfig>) -> Result<&'a BbgConfig> {
+    bbg.ok_or_else(|| anyhow!("Project {} does not support Baseband Guard", project_key))
+}
+
+fn validate_kernel_version(project_key: &str, expected: Option<&str>, actual: &str) -> Result<()> {
+    if let Some(expected) = expected
+        && actual != expected
+    {
+        return Err(anyhow!(
+            "Project {} requires kernel {}, but the source reports {}",
+            project_key,
+            expected,
+            actual
+        ));
+    }
     Ok(())
 }
 
-fn stage_patch_in_cwd(patch_file: &Path, cwd: &Path) -> Result<PathBuf> {
-    let file_name = patch_file
-        .file_name()
-        .ok_or_else(|| anyhow!("Invalid patch file path: {:?}", patch_file))?;
-    let staged_patch = cwd.join(file_name);
-    fs::copy(patch_file, &staged_patch)?;
-    Ok(staged_patch)
-}
-
-fn cleanup_staged_patch(staged_patch: &Path, original_patch: &Path) {
-    if staged_patch != original_patch {
-        let _ = fs::remove_file(staged_patch);
-    }
-}
-
-fn run_patch_command(patch_file: &Path, cwd: &Path, dry_run: bool) -> Result<bool> {
-    let staged_patch = stage_patch_in_cwd(patch_file, cwd)?;
-    let result = (|| {
-        let patch_name = staged_patch
-            .file_name()
-            .ok_or_else(|| anyhow!("Invalid staged patch path: {:?}", staged_patch))?;
-
-        let mut command = std::process::Command::new("patch");
-        command.arg("-p1").arg("-N").arg("-F").arg("3");
-        if dry_run {
-            command.arg("--dry-run");
-        }
-        let status = command
-            .arg("-i")
-            .arg(patch_name)
-            .current_dir(cwd)
-            .status()?;
-        Ok(status.success())
-    })();
-    cleanup_staged_patch(&staged_patch, patch_file);
-    result
-}
-
-fn can_apply_patch(patch_file: &Path, cwd: &Path) -> Result<bool> {
-    run_patch_command(patch_file, cwd, true)
-}
-
-fn run_patch(patch_file: &Path, cwd: &Path) -> Result<bool> {
-    run_patch_command(patch_file, cwd, false)
-}
-
-fn apply_patch_once(patch_file: &Path, cwd: &Path) -> Result<bool> {
-    if can_apply_patch(patch_file, cwd)? {
-        return run_patch(patch_file, cwd);
-    }
-    Ok(false)
-}
-
-fn apply_patch_with_fallbacks(
-    patch_file: &Path,
-    kernel_source_path: &Path,
-    fallback_dirs: &[String],
-) -> Result<()> {
-    if apply_patch_once(patch_file, kernel_source_path)? {
-        return Ok(());
-    }
-
-    for fallback in fallback_dirs {
-        let cwd = kernel_source_path.join(fallback);
-        if cwd.is_dir() && apply_patch_once(patch_file, &cwd)? {
-            return Ok(());
-        }
-    }
-
-    Err(anyhow!("Failed to apply patch {:?}", patch_file))
-}
-
-/// The upstream SuSFS patch targets vanilla GKI task_mmu.c. On kernels where
-/// show_smap()/show_smaps_rollup() diverge (e.g. vma_pages() instead of
-/// vma_data_pages(), rewritten rollup loop), GNU patch with fuzz 3 silently
-/// lands three SUS_MAP hunks in wrong functions (smaps_rollup_open and
-/// pte_is_pinned), which then fails to compile ('vma' undeclared).
-/// Detect those exact misplacements and re-apply the intent at the correct
-/// anchors. No-op when the patch already applied cleanly; hard error when a
-/// known misplacement is present but an anchor is missing, so we never ship
-/// a silently broken patch.
-fn fix_susfs_task_mmu(kernel_source_path: &Path) -> Result<()> {
-    let path = find_first_existing_dir(
-        kernel_source_path,
-        &[
-            "common/fs/proc".to_string(),
-            "kernel_platform/common/fs/proc".to_string(),
-            "fs/proc".to_string(),
-        ],
-    )
-    .map(|d| d.join("task_mmu.c"))
-    .filter(|p| p.exists());
-    let Some(path) = path else {
-        return Ok(());
-    };
-    let mut content = fs::read_to_string(&path)?;
-
-    // Misplacement A: show_smap() SUS_MAP block landed in smaps_rollup_open().
-    let bad_a = "\tint ret;\n#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n\tif (vma->vm_file) {\n\t\tif (SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))\n\t\t\treturn 0;\n\t}\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n\n";
-    if content.contains(bad_a) {
-        content = content.replacen(bad_a, "\tint ret;\n", 1);
-
-        let anchor = "\tstruct mem_size_stats mss = {};\n\n\tif (!vma_pages(vma))";
-        let fixed = "\tstruct mem_size_stats mss = {};\n\n#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n\tif (vma->vm_file) {\n\t\tif (SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))\n\t\t\treturn 0;\n\t}\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n\n\tif (!vma_pages(vma))";
-        if !content.contains(anchor) {
-            return Err(anyhow!(
-                "SuSFS task_mmu fix: show_smap anchor not found in {:?}",
-                path
-            ));
-        }
-        content = content.replacen(anchor, fixed, 1);
-        println!("Fixed misplaced SuSFS show_smap hunk in task_mmu.c");
-    }
-
-    // Misplacement B: show_smaps_rollup() SUS_MAP check landed in pte_is_pinned().
-    let bad_b = "{\n#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n\t\tif (vma->vm_file && SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))\n\t\t\tgoto bypass_orig_flow;\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n\n\tstruct folio *folio;";
-    let bad_c = "\treturn folio_maybe_dma_pinned(folio);\n#ifdef CONFIG_KSU_SUSFS_SUS_MAP\nbypass_orig_flow:\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n}";
-    if content.contains(bad_b) || content.contains(bad_c) {
-        content = content.replacen(bad_b, "{\n\tstruct folio *folio;", 1);
-        content = content.replacen(bad_c, "\treturn folio_maybe_dma_pinned(folio);\n}", 1);
-
-        // Correct rollup behaviour: skip stats gathering for sus_map VMAs,
-        // still advancing last_vma_end (same as upstream bypass_orig_flow).
-        let gather = "\t\tsmap_gather_stats(vma, &mss, 0);\n\t\tlast_vma_end = vma->vm_end;";
-        let fixed_gather = "#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n\t\tif (!vma->vm_file || !SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n\t\t\tsmap_gather_stats(vma, &mss, 0);\n\t\tlast_vma_end = vma->vm_end;";
-        if !content.contains(gather) {
-            return Err(anyhow!(
-                "SuSFS task_mmu fix: show_smaps_rollup anchor not found in {:?}",
-                path
-            ));
-        }
-        content = content.replacen(gather, fixed_gather, 1);
-        println!("Fixed misplaced SuSFS show_smaps_rollup hunk in task_mmu.c");
-    }
-
-    fs::write(&path, content)?;
-    Ok(())
+fn last_nonempty_output_line(output: &str) -> Option<&str> {
+    output
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
 }
 
 fn ensure_bbg_lsm(content: &str) -> String {
@@ -767,106 +1705,102 @@ fn ensure_bbg_lsm(content: &str) -> String {
     lines.join("\n") + "\n"
 }
 
-fn apply_susfs_overlay(kernel_source_path: &Path, susfs: &SusfsConfig) -> Result<()> {
-    let temp_dir = kernel_source_path.join(".susfs_workspace");
-    if temp_dir.exists() {
-        fs::remove_dir_all(&temp_dir)?;
-    }
-
-    run_cmd(
-        &[
-            "git",
-            "clone",
-            "--depth=1",
-            "--branch",
-            &susfs.branch,
-            &susfs.repo,
-            temp_dir
-                .to_str()
-                .ok_or_else(|| anyhow!("Invalid temp path"))?,
-        ],
-        None,
-        false,
+fn set_hybridmount_config(
+    kernel_source_path: &Path,
+    defconfig_name: &str,
+    enabled: bool,
+) -> Result<()> {
+    let defconfig_path = project_defconfig_path(kernel_source_path, defconfig_name)
+        .map_err(|err| anyhow!("Could not locate defconfig for Hybrid Mount: {err}"))?;
+    let defconfig_content = fs::read_to_string(&defconfig_path)?;
+    fs::write(
+        defconfig_path,
+        upsert_kconfig_entry(
+            &defconfig_content,
+            "CONFIG_HYBRIDMOUNT",
+            if enabled { "y" } else { "n" },
+        ),
     )?;
-
-    let patch_path = temp_dir.join(&susfs.patch_path);
-    if !patch_path.exists() {
-        fs::remove_dir_all(&temp_dir)?;
-        return Err(anyhow!("SuSFS patch not found: {:?}", patch_path));
-    }
-
-    if let Ok(content) = fs::read_to_string(&patch_path) {
-        if content.contains("getname_flags(filename, lookup_flags, NULL);") {
-            let fixed_content = content.replace(
-                "getname_flags(filename, lookup_flags, NULL);",
-                "getname_flags(filename, lookup_flags);",
-            );
-            let _ = fs::write(&patch_path, fixed_content);
-        }
-    }
-
-    let fs_source = temp_dir.join(susfs.fs_patch_dir.as_deref().unwrap_or("kernel_patches/fs"));
-    let fs_target = find_first_existing_dir(
-        kernel_source_path,
-        &[
-            "common/fs".to_string(),
-            "kernel_platform/common/fs".to_string(),
-            "fs".to_string(),
-        ],
-    )
-    .ok_or_else(|| anyhow!("Could not locate kernel fs directory for SuSFS"))?;
-    copy_dir_files(&fs_source, &fs_target)?;
-
-    let include_source = temp_dir.join(
-        susfs
-            .include_linux_patch_dir
-            .as_deref()
-            .unwrap_or("kernel_patches/include/linux"),
-    );
-    let include_target = find_first_existing_dir(
-        kernel_source_path,
-        &[
-            "common/include/linux".to_string(),
-            "kernel_platform/common/include/linux".to_string(),
-            "include/linux".to_string(),
-        ],
-    )
-    .ok_or_else(|| anyhow!("Could not locate kernel include/linux directory for SuSFS"))?;
-    copy_dir_files(&include_source, &include_target)?;
-
-    apply_patch_with_fallbacks(
-        &patch_path,
-        kernel_source_path,
-        &["common".to_string(), "kernel_platform/common".to_string()],
-    )?;
-
-    fix_susfs_task_mmu(kernel_source_path)?;
-
-    let susfs_entries = vec![
-        ("CONFIG_KSU_SUSFS", "y"),
-        ("CONFIG_KSU_SUSFS_SUS_PATH", "y"),
-        ("CONFIG_KSU_SUSFS_SUS_MOUNT", "y"),
-        ("CONFIG_KSU_SUSFS_SUS_KSTAT", "y"),
-        ("CONFIG_KSU_SUSFS_SPOOF_UNAME", "y"),
-        ("CONFIG_KSU_SUSFS_ENABLE_LOG", "y"),
-        ("CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS", "y"),
-        ("CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG", "y"),
-        ("CONFIG_KSU_SUSFS_OPEN_REDIRECT", "y"),
-        ("CONFIG_KSU_SUSFS_SUS_MAP", "y"),
-    ];
-
-    for path in &[
-        kernel_source_path.join("arch/arm64/configs/gki_defconfig"),
-        kernel_source_path.join("common/arch/arm64/configs/gki_defconfig"),
-        kernel_source_path.join("kernel_platform/common/arch/arm64/configs/gki_defconfig"),
-    ] {
-        if path.exists() {
-            let _ = update_kconfig_file(path, &susfs_entries);
-        }
-    }
-
-    fs::remove_dir_all(&temp_dir)?;
     Ok(())
+}
+
+/// Resolves the Hybrid Mount setup script in a fresh checkout of the upstream repository.
+///
+/// The script is spawned with the kernel source root as its working directory, so the path
+/// handed to `sh` must be absolute: the relative form resolves against that working
+/// directory (kernel_source/kernel_source/...) and is never found.
+fn hybridmount_setup_script(temp_dir: &Path) -> Result<PathBuf> {
+    fs::canonicalize(temp_dir.join("module/vfs/setup.sh"))
+        .map_err(|err| anyhow!("Hybrid Mount setup script missing in {HYBRIDMOUNT_REPO}: {err}"))
+}
+
+fn apply_hybridmount_overlay(kernel_source_path: &Path, defconfig_name: &str) -> Result<()> {
+    let source_kconfig = find_first_existing_path(
+        kernel_source_path,
+        &[
+            "fs/Kconfig".to_string(),
+            "common/fs/Kconfig".to_string(),
+            "kernel_platform/common/fs/Kconfig".to_string(),
+        ],
+    )
+    .ok_or_else(|| anyhow!("Could not locate kernel fs/Kconfig for Hybrid Mount"))?;
+    let source_root = source_kconfig
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| anyhow!("Could not locate kernel source root for Hybrid Mount"))?;
+    let fs_makefile = read_text_allow_missing(&source_root.join("fs/Makefile"))?;
+    let fs_kconfig = read_text_allow_missing(&source_kconfig)?;
+    if source_root.join("fs/nomount").is_dir()
+        || fs_makefile.contains("nomount")
+        || fs_kconfig.contains("fs/nomount/Kconfig")
+    {
+        return Err(anyhow!(
+            "Hybrid Mount cannot be enabled because this kernel already integrates NoMount"
+        ));
+    }
+    let hybridmount_dir = source_root.join("fs/hybridmount");
+
+    if hybridmount_dir.is_dir() {
+        println!("Hybrid Mount is already integrated; keeping the in-tree sources.");
+    } else {
+        let temp_dir = kernel_source_path.join(".hybridmount_workspace");
+        if temp_dir.exists() {
+            fs::remove_dir_all(&temp_dir)?;
+        }
+
+        run_cmd(
+            &[
+                "git",
+                "clone",
+                "--depth=1",
+                "--branch",
+                HYBRIDMOUNT_BRANCH,
+                HYBRIDMOUNT_REPO,
+                temp_dir
+                    .to_str()
+                    .ok_or_else(|| anyhow!("Invalid Hybrid Mount temp path"))?,
+            ],
+            None,
+            false,
+        )?;
+
+        let setup_script = hybridmount_setup_script(&temp_dir)?;
+        let setup_result = run_cmd(
+            &[
+                "sh",
+                setup_script
+                    .to_str()
+                    .ok_or_else(|| anyhow!("Invalid Hybrid Mount setup path"))?,
+            ],
+            Some(source_root),
+            false,
+        );
+        let cleanup_result = fs::remove_dir_all(&temp_dir);
+        setup_result?;
+        cleanup_result?;
+    }
+
+    set_hybridmount_config(kernel_source_path, defconfig_name, true)
 }
 
 fn apply_bbg_overlay(
@@ -874,20 +1808,9 @@ fn apply_bbg_overlay(
     proj: &ProjectConfig,
     bbg: Option<&BbgConfig>,
 ) -> Result<()> {
-    let defconfig_path = find_first_existing_path(
-        kernel_source_path,
-        &[
-            format!("arch/arm64/configs/{}", proj.defconfig),
-            format!("common/arch/arm64/configs/{}", proj.defconfig),
-            format!("kernel_platform/arch/arm64/configs/{}", proj.defconfig),
-            format!(
-                "kernel_platform/common/arch/arm64/configs/{}",
-                proj.defconfig
-            ),
-        ],
-    )
-    .ok_or_else(|| anyhow!("Could not locate defconfig for BBG"))?;
-    let defconfig_content = fs::read_to_string(&defconfig_path).unwrap_or_default();
+    let defconfig_path = project_defconfig_path(kernel_source_path, &proj.defconfig)
+        .map_err(|err| anyhow!("Could not locate defconfig for BBG: {err}"))?;
+    let defconfig_content = fs::read_to_string(&defconfig_path)?;
     fs::write(
         &defconfig_path,
         upsert_kconfig_entry(&defconfig_content, "CONFIG_BBG", "y"),
@@ -906,8 +1829,7 @@ fn apply_bbg_overlay(
     let setup_url = bbg
         .and_then(|cfg| cfg.setup_url.as_deref())
         .unwrap_or("https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh");
-    let cmd = format!("curl -LSs '{}' | bash", setup_url);
-    run_cmd(&["bash", "-c", &cmd], Some(&common_root), false)?;
+    run_setup_script(setup_url, None, &common_root)?;
 
     let security_kconfig = find_first_existing_path(
         &common_root,
@@ -928,8 +1850,7 @@ fn apply_bbg_overlay(
     })
     .ok_or_else(|| anyhow!("Could not locate security/Kconfig for BBG"))?;
 
-    let security_content = fs::read_to_string(&security_kconfig).unwrap_or_default();
-    fs::write(&security_kconfig, ensure_bbg_lsm(&security_content))?;
+    edit_text_file(&security_kconfig, |content| ensure_bbg_lsm(&content))?;
 
     Ok(())
 }
@@ -937,31 +1858,32 @@ fn apply_bbg_overlay(
 fn patch_setlocalversion_remove_dirty(kernel_source_path: &Path) -> Result<()> {
     let setlocalversion_path = kernel_source_path.join("scripts/setlocalversion");
     if setlocalversion_path.exists() {
-        let mut content = fs::read_to_string(&setlocalversion_path).unwrap_or_default();
-        content = content.replace(" -dirty", "");
+        edit_text_file(&setlocalversion_path, |mut content| {
+            content = content.replace(" -dirty", "");
 
-        let dirty_cleanup_line = r#"res=$(echo "$res" | sed 's/-dirty//g')"#;
-        let final_release_echo = r#"echo "${KERNELVERSION}${file_localversion}${config_localversion}${LOCALVERSION}${scm_version}""#;
+            let dirty_cleanup_line = r#"res=$(echo "$res" | sed 's/-dirty//g')"#;
+            let final_release_echo = r#"echo "${KERNELVERSION}${file_localversion}${config_localversion}${LOCALVERSION}${scm_version}""#;
 
-        if !content.contains(dirty_cleanup_line) {
-            if let Some(final_echo_pos) = content.rfind(final_release_echo) {
-                content.insert_str(final_echo_pos, &format!("{dirty_cleanup_line}\n"));
-            } else {
-                if !content.ends_with('\n') {
+            if !content.contains(dirty_cleanup_line) {
+                if let Some(final_echo_pos) = content.rfind(final_release_echo) {
+                    content.insert_str(final_echo_pos, &format!("{dirty_cleanup_line}\n"));
+                } else {
+                    if !content.ends_with('\n') {
+                        content.push('\n');
+                    }
+                    content.push_str(dirty_cleanup_line);
                     content.push('\n');
                 }
-                content.push_str(dirty_cleanup_line);
-                content.push('\n');
             }
-        }
 
-        fs::write(&setlocalversion_path, content)?;
+            content
+        })?;
     }
 
     Ok(())
 }
 
-fn apply_sm8850_localversion(
+fn apply_gki_localversion(
     kernel_source_path: &Path,
     defconfig_name: &str,
     localversion: &str,
@@ -970,30 +1892,36 @@ fn apply_sm8850_localversion(
 
     let setlocalversion_path = kernel_source_path.join("scripts/setlocalversion");
     if setlocalversion_path.exists() {
-        let mut content = fs::read_to_string(&setlocalversion_path).unwrap_or_default();
-
-        content = content.replace("${scm_version}", "");
-        fs::write(&setlocalversion_path, content)?;
+        edit_text_file(&setlocalversion_path, |content| {
+            content.replace("${scm_version}", "")
+        })?;
     }
 
-    let defconfig_path = kernel_source_path.join(format!("arch/arm64/configs/{}", defconfig_name));
-    if defconfig_path.exists() {
-        let mut defconfig_content = fs::read_to_string(&defconfig_path).unwrap_or_default();
-        defconfig_content = upsert_kconfig_entry(
-            &defconfig_content,
-            "CONFIG_LOCALVERSION",
-            &format!("\"{}\"", localversion),
-        );
-        defconfig_content =
-            upsert_kconfig_entry(&defconfig_content, "CONFIG_LOCALVERSION_AUTO", "n");
-        fs::write(defconfig_path, defconfig_content)?;
-    }
+    let defconfig_path = project_defconfig_path(kernel_source_path, defconfig_name)?;
+    let mut defconfig_content = fs::read_to_string(&defconfig_path)?;
+    defconfig_content = upsert_kconfig_entry(
+        &defconfig_content,
+        "CONFIG_LOCALVERSION",
+        &format!("\"{}\"", localversion),
+    );
+    defconfig_content = upsert_kconfig_entry(&defconfig_content, "CONFIG_LOCALVERSION_AUTO", "n");
+    fs::write(defconfig_path, defconfig_content)?;
 
     Ok(())
 }
 
 fn uses_file_localversion(proj: &ProjectConfig) -> bool {
     proj.version_method.as_deref().unwrap_or("param") == "file"
+}
+
+/// ACK/GKI-6.12 trees share one pipeline: they need the prebuilt ACK clang
+/// environment, a rust/bindgen toolchain, `_setup_env.sh` around every make
+/// invocation, and `KBUILD_GENDWARFKSYMS_STABLE` so exported-symbol CRCs stay
+/// reproducible. Projects opt in with `build_style`; `nezha_sm8850` selected the
+/// same path through its soc suffix before that field existed.
+fn uses_gki_612_pipeline(project_key: &str, proj: &ProjectConfig) -> bool {
+    project_key.split('_').nth(1) == Some(GKI_612_LEGACY_SOC)
+        || proj.build_style.as_deref() == Some(GKI_612_BUILD_STYLE)
 }
 
 fn run_make_targets(
@@ -1025,14 +1953,6 @@ fn run_make_targets(
     }
 }
 
-fn last_nonempty_output_line(output: &str) -> Option<&str> {
-    output
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-}
-
 fn capture_make_output(
     kernel_source_path: &Path,
     target: &str,
@@ -1060,26 +1980,215 @@ fn update_kconfig_file(path: &Path, entries: &[(&str, &str)]) -> Result<()> {
         return Ok(());
     }
 
-    let mut content = fs::read_to_string(path).unwrap_or_default();
-    for (key, value) in entries {
-        content = upsert_kconfig_entry(&content, key, value);
+    edit_text_file(path, |mut content| {
+        for (key, value) in entries {
+            content = upsert_kconfig_entry(&content, key, value);
+        }
+        content
+    })
+}
+
+fn project_defconfig_path(kernel_source_path: &Path, defconfig_name: &str) -> Result<PathBuf> {
+    find_first_existing_path(
+        kernel_source_path,
+        &[
+            format!("arch/arm64/configs/{defconfig_name}"),
+            format!("common/arch/arm64/configs/{defconfig_name}"),
+            format!("kernel_platform/arch/arm64/configs/{defconfig_name}"),
+            format!("kernel_platform/common/arch/arm64/configs/{defconfig_name}"),
+        ],
+    )
+    .ok_or_else(|| anyhow!("Could not locate defconfig: {}", defconfig_name))
+}
+
+fn validate_kconfig_entries(path: &Path, entries: &[(&str, &str)]) -> Result<()> {
+    let content = fs::read_to_string(path)?;
+    let missing: Vec<&str> = entries
+        .iter()
+        .filter_map(|(key, value)| {
+            let expected = format!("{key}={value}");
+            (!content.lines().any(|line| {
+                line == expected || (*value == "n" && line == format!("# {key} is not set"))
+            }))
+            .then_some(*key)
+        })
+        .collect();
+
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "Final kernel config is missing required entries: {}",
+            missing.join(", ")
+        ))
     }
-    fs::write(path, content)?;
+}
+
+/// Reads a `CONFIG_x=y` fragment into `(key, value)` pairs, following `source`
+/// includes so a tuning set can be assembled from small per-topic files.
+///
+/// Comments (`#`) and blank lines are ignored. Everything after the first `=` is
+/// the value, so quoted strings such as `CONFIG_DEFAULT_TCP_CONG="cubic"` survive
+/// intact. Malformed lines are rejected rather than silently skipped: a typo in a
+/// tuning fragment would otherwise ship an unmodified kernel.
+///
+/// `source <path>` resolves relative to `owner`'s directory, and a later entry wins
+/// over an earlier one, so `source` order is meaningful. Includes are cycle checked
+/// and depth bounded so a bad fragment cannot recurse forever.
+fn parse_kconfig_fragment(content: &str, owner: &Path) -> Result<Vec<(String, String)>> {
+    let mut entries = Vec::new();
+    let mut visited = vec![owner.to_path_buf()];
+    parse_kconfig_fragment_into(content, owner, &mut entries, &mut visited)?;
+    Ok(entries)
+}
+
+const MAX_FRAGMENT_DEPTH: usize = 16;
+
+fn parse_kconfig_fragment_into(
+    content: &str,
+    owner: &Path,
+    entries: &mut Vec<(String, String)>,
+    visited: &mut Vec<PathBuf>,
+) -> Result<()> {
+    if visited.len() >= MAX_FRAGMENT_DEPTH {
+        return Err(anyhow!(
+            "Kconfig fragment include chain is deeper than {MAX_FRAGMENT_DEPTH} at {}",
+            owner.display()
+        ));
+    }
+
+    for (index, raw) in content.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        if let Some(target) = line.strip_prefix("source ") {
+            let target = target.trim();
+            if target.is_empty() {
+                return Err(anyhow!(
+                    "Kconfig fragment {}:{}: source needs a path",
+                    owner.display(),
+                    index + 1
+                ));
+            }
+            let path = owner
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(target);
+            if visited.contains(&path) {
+                return Err(anyhow!(
+                    "Kconfig fragment include cycle: {} already included",
+                    path.display()
+                ));
+            }
+            let included = fs::read_to_string(&path).map_err(|err| {
+                anyhow!("Cannot read included fragment {}: {err}", path.display())
+            })?;
+            visited.push(path.clone());
+            parse_kconfig_fragment_into(&included, &path, entries, visited)?;
+            visited.pop();
+            continue;
+        }
+
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(anyhow!(
+                "Malformed kconfig fragment line {}: {raw}",
+                index + 1
+            ));
+        };
+        let key = key.trim();
+        if !key.starts_with("CONFIG_") {
+            return Err(anyhow!(
+                "Malformed kconfig fragment line {}: {raw} (expected a CONFIG_ key)",
+                index + 1
+            ));
+        }
+        entries.push((key.to_string(), value.trim().to_string()));
+    }
     Ok(())
 }
 
-fn prepare_sm8850_build(
+/// Overlays a kconfig fragment onto the project defconfig so the fragment, not the
+/// full `.config`, is the single source of truth for a tuning delta.
+fn apply_kconfig_fragment(
+    kernel_source_path: &Path,
+    defconfig_name: &str,
+    fragment_relative_path: &str,
+) -> Result<()> {
+    let fragment_path = kernel_source_path.join(fragment_relative_path);
+    let fragment = fs::read_to_string(&fragment_path).map_err(|err| {
+        anyhow!(
+            "Cannot read kconfig fragment {}: {err}",
+            fragment_path.display()
+        )
+    })?;
+    let entries = parse_kconfig_fragment(&fragment, &fragment_path)?;
+    if entries.is_empty() {
+        return Err(anyhow!(
+            "Kconfig fragment {} defines no CONFIG_ entries",
+            fragment_path.display()
+        ));
+    }
+
+    let defconfig_file = project_defconfig_path(kernel_source_path, defconfig_name)?;
+    let owned: Vec<(&str, &str)> = entries
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    update_kconfig_file(&defconfig_file, &owned)?;
+    println!(
+        "Applied {} tuning entr{} from {}",
+        entries.len(),
+        if entries.len() == 1 { "y" } else { "ies" },
+        fragment_relative_path
+    );
+    Ok(())
+}
+
+pub fn integrate_bakasu_hooks(
+    source: &Path,
+    project: &str,
+    defconfig: &str,
+    final_config: Option<&Path>,
+) -> Result<()> {
+    let script = crate::utils::get_root_dir().join("scripts/bakasu-hooks.py");
+    let mut command = std::process::Command::new("python3");
+    command
+        .arg(script)
+        .arg("--source")
+        .arg(source)
+        .arg("--project")
+        .arg(project)
+        .arg("--defconfig")
+        .arg(defconfig);
+    if let Some(config) = final_config {
+        command.arg("--check-config").arg(config);
+    }
+    let status = command
+        .status()
+        .context("Cannot run BakaSU hook integration")?;
+    if !status.success() {
+        return Err(anyhow!(
+            "BakaSU hook integration failed for {project}: {status}"
+        ));
+    }
+    Ok(())
+}
+
+fn prepare_gki_build(
     kernel_source_path: &Path,
     proj: &ProjectConfig,
     enable_ksu: bool,
 ) -> Result<()> {
     let build_config_path = kernel_source_path.join("build.config.gki");
     if build_config_path.exists() {
-        let content = fs::read_to_string(&build_config_path).unwrap_or_default();
-        fs::write(&build_config_path, content.replace("check_defconfig", ""))?;
+        edit_text_file(&build_config_path, |content| {
+            content.replace("check_defconfig", "")
+        })?;
     }
 
-    let defconfig_file = kernel_source_path.join(format!("arch/arm64/configs/{}", proj.defconfig));
+    let defconfig_file = project_defconfig_path(kernel_source_path, &proj.defconfig)?;
     let mut entries = vec![
         ("CONFIG_RUST", "y"),
         ("CONFIG_ANDROID_BINDER_IPC_RUST", "m"),
@@ -1088,31 +2197,447 @@ fn prepare_sm8850_build(
         ("CONFIG_TMPFS_XATTR", "y"),
         ("CONFIG_TMPFS_POSIX_ACL", "y"),
     ];
+    entries.extend_from_slice(GKI_CUSTOM_KCONFIG_ENTRIES);
     if enable_ksu {
-        entries.push(("CONFIG_KSU", "y"));
-        entries.push(("CONFIG_KSU_SUSFS", "y"));
-        entries.push(("CONFIG_KSU_SUSFS_SUS_PATH", "y"));
-        entries.push(("CONFIG_KSU_SUSFS_SUS_MOUNT", "y"));
-        entries.push(("CONFIG_KSU_SUSFS_SUS_KSTAT", "y"));
-        entries.push(("CONFIG_KSU_SUSFS_SPOOF_UNAME", "y"));
-        entries.push(("CONFIG_KSU_SUSFS_ENABLE_LOG", "y"));
-        entries.push(("CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS", "y"));
-        entries.push(("CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG", "y"));
-        entries.push(("CONFIG_KSU_SUSFS_OPEN_REDIRECT", "y"));
-        entries.push(("CONFIG_KSU_SUSFS_SUS_MAP", "y"));
+        entries.extend_from_slice(COMMON_KSU_KCONFIG_ENTRIES);
     }
     update_kconfig_file(&defconfig_file, &entries)
 }
 
-pub fn handle_build(
-    project_key: String,
-    branch: String,
-    do_release: bool,
-    custom_localversion: Option<String>,
-    resukisu_setup_arg: Option<String>,
-    apply_susfs: bool,
-    apply_bbg: bool,
+/// Parses one `Module.symvers` line into `(crc, symbol)`.
+///
+/// The format is tab-separated: `0x1234abcd<TAB>symbol<TAB>module<TAB>export`.
+fn parse_symvers_line(line: &str) -> Option<(String, String)> {
+    let mut fields = line.split('\t');
+    let crc = fields.next()?.trim();
+    let symbol = fields.next()?.trim();
+    if crc.is_empty() || symbol.is_empty() {
+        return None;
+    }
+    Some((crc.to_string(), symbol.to_string()))
+}
+
+/// Loads every exported symbol the build produced.
+///
+/// `make Image` alone may only emit the vmlinux subset (`vmlinux.symvers`);
+/// `Module.symvers` additionally carries module exports. Read whichever exist and
+/// merge, so a symbol counts as missing only when neither file has it.
+fn read_kernel_symvers(kernel_source_path: &Path) -> Result<HashMap<String, String>> {
+    let symvers_paths: Vec<PathBuf> = ["out/Module.symvers", "out/vmlinux.symvers"]
+        .iter()
+        .map(|relative| kernel_source_path.join(relative))
+        .filter(|path| path.is_file())
+        .collect();
+    if symvers_paths.is_empty() {
+        return Err(anyhow!(
+            "Cannot verify the kernel ABI: neither out/Module.symvers nor out/vmlinux.symvers was produced"
+        ));
+    }
+
+    let mut found = HashMap::new();
+    for symvers_path in &symvers_paths {
+        let content = fs::read_to_string(symvers_path)
+            .map_err(|err| anyhow!("Cannot read {}: {err}", symvers_path.display()))?;
+        for line in content.lines() {
+            if let Some((crc, symbol)) = parse_symvers_line(line) {
+                found.insert(symbol, crc);
+            }
+        }
+    }
+    Ok(found)
+}
+
+fn read_symvers_file(path: &Path) -> Result<HashMap<String, String>> {
+    let content = fs::read_to_string(path)
+        .map_err(|err| anyhow!("Cannot read ABI baseline {}: {err}", path.display()))?;
+    Ok(content
+        .lines()
+        .filter_map(parse_symvers_line)
+        .map(|(crc, symbol)| (symbol, crc))
+        .collect())
+}
+
+fn is_ignored_symbol(symbol: &str, ignore_prefixes: &[String]) -> bool {
+    ignore_prefixes
+        .iter()
+        .any(|prefix| symbol.starts_with(prefix.as_str()))
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct AbiDiff {
+    compared: usize,
+    crc_mismatch: Vec<(String, String, String)>,
+    missing: Vec<String>,
+    extra: Vec<String>,
+}
+
+/// Compares the built symbol table against the baseline.
+///
+/// A symbol the baseline exports but the build does not is a hard failure: the
+/// stock modules are never rebuilt, so one of them may import it. Symbols only the
+/// build exports are harmless additions and are reported for information. `extra`
+/// and `missing` are sorted so the report is stable across runs.
+fn diff_symvers(
+    built: &HashMap<String, String>,
+    baseline: &HashMap<String, String>,
+    ignore_prefixes: &[String],
+) -> AbiDiff {
+    let mut report = AbiDiff::default();
+
+    for (symbol, expected) in baseline {
+        if is_ignored_symbol(symbol, ignore_prefixes) {
+            continue;
+        }
+        report.compared += 1;
+        match built.get(symbol) {
+            Some(actual) if actual.eq_ignore_ascii_case(expected) => {}
+            Some(actual) => {
+                report
+                    .crc_mismatch
+                    .push((symbol.clone(), expected.clone(), actual.clone()))
+            }
+            None => report.missing.push(symbol.clone()),
+        }
+    }
+
+    for symbol in built.keys() {
+        if is_ignored_symbol(symbol, ignore_prefixes) {
+            continue;
+        }
+        if !baseline.contains_key(symbol) {
+            report.extra.push(symbol.clone());
+        }
+    }
+
+    report.crc_mismatch.sort();
+    report.missing.sort();
+    report.extra.sort();
+    report
+}
+
+/// Verifies that the build reproduced the stock kernel's exported-symbol CRCs.
+///
+/// A GKI kernel must stay ABI-compatible with the modules already on the device,
+/// which are never rebuilt here. `vendor_data_pad` is the canary: it is the only
+/// CRC that stock and a from-source build disagree on when
+/// `GKI_TASK_STRUCT_VENDOR_SIZE_MAX` is overridden, and a mismatch there makes
+/// stock modules refuse to load and the device panic before `init`.
+fn verify_abi_symbol_gates(
+    kernel_source_path: &Path,
+    gates: &HashMap<String, String>,
 ) -> Result<()> {
+    if gates.is_empty() {
+        return Ok(());
+    }
+    let found = read_kernel_symvers(kernel_source_path)?;
+
+    let mut mismatches = Vec::new();
+    for (symbol, expected) in gates {
+        match found.get(symbol.as_str()) {
+            Some(actual) if actual.eq_ignore_ascii_case(expected) => {}
+            Some(actual) => {
+                mismatches.push(format!("{symbol}: expected {expected}, built {actual}"))
+            }
+            None => mismatches.push(format!("{symbol}: not exported by the built kernel")),
+        }
+    }
+
+    if mismatches.is_empty() {
+        return Ok(());
+    }
+
+    Err(anyhow!(
+        "Kernel ABI mismatch — stock modules would fail to load: {}",
+        mismatches.join("; ")
+    ))
+}
+
+/// Compares the whole built symbol table against a baseline `symvers` file.
+///
+/// This is the experiment-grade gate: the fixed `abi_symbol_gates` list catches
+/// struct-layout drift, but a tuning experiment can move a symbol the list does not
+/// name. A full diff reports exactly which symbols moved, so an experiment is graded
+/// by evidence instead of by a bootloop.
+fn verify_abi_baseline(kernel_source_path: &Path, baseline: &AbiBaseline) -> Result<()> {
+    let baseline_path = kernel_source_path.join(&baseline.path);
+    let expected = read_symvers_file(&baseline_path)?;
+    if expected.is_empty() {
+        return Err(anyhow!(
+            "ABI baseline {} holds no symbols",
+            baseline_path.display()
+        ));
+    }
+    let built = read_kernel_symvers(kernel_source_path)?;
+    let report = diff_symvers(&built, &expected, &baseline.ignore_prefixes);
+
+    // Split out the deltas a deliberate change is allowed to cause. Naming them
+    // keeps the exception visible in review instead of hiding it behind a count.
+    let (accepted_crc, crc_mismatch): (Vec<_>, Vec<_>) = report
+        .crc_mismatch
+        .iter()
+        .partition(|(symbol, _, _)| baseline.allowed_crc_symbols.contains(symbol));
+    let (accepted_missing, missing): (Vec<_>, Vec<_>) = report
+        .missing
+        .iter()
+        .partition(|symbol| baseline.allowed_missing_symbols.contains(symbol));
+
+    println!(
+        "ABI baseline {}: compared {} symbols, {} CRC mismatch ({} accepted), {} missing ({} accepted), {} extra",
+        baseline.path,
+        report.compared,
+        crc_mismatch.len(),
+        accepted_crc.len(),
+        missing.len(),
+        accepted_missing.len(),
+        report.extra.len()
+    );
+    for (symbol, want, got) in crc_mismatch.iter().take(ABI_REPORT_LIMIT) {
+        println!("  CRC {symbol}: baseline {want}, built {got}");
+    }
+    for symbol in missing.iter().take(ABI_REPORT_LIMIT) {
+        println!("  MISSING {symbol}");
+    }
+    for (symbol, want, got) in &accepted_crc {
+        println!("  CRC {symbol}: {want} -> {got} (accepted)");
+    }
+    for symbol in &accepted_missing {
+        println!("  MISSING {symbol} (accepted)");
+    }
+    if report.extra.len() <= ABI_REPORT_LIMIT {
+        for symbol in &report.extra {
+            println!("  extra (harmless) {symbol}");
+        }
+    } else {
+        println!(
+            "  {} extra symbols (harmless additions, not listed)",
+            report.extra.len()
+        );
+    }
+
+    let mut failures = Vec::new();
+    if crc_mismatch.len() > baseline.allow_crc_mismatch {
+        failures.push(format!(
+            "{} symbol(s) changed CRC (allowed {})",
+            crc_mismatch.len(),
+            baseline.allow_crc_mismatch
+        ));
+    }
+    if missing.len() > baseline.allow_missing {
+        failures.push(format!(
+            "{} baseline symbol(s) no longer exported (allowed {})",
+            missing.len(),
+            baseline.allow_missing
+        ));
+    }
+    if failures.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "Kernel ABI baseline mismatch — stock modules may fail to load: {}",
+        failures.join("; ")
+    ))
+}
+
+const ABI_REPORT_LIMIT: usize = 40;
+
+/// One row of the consumer manifest: a symbol the stock vendor modules import.
+#[derive(Debug, PartialEq)]
+struct ConsumerEntry {
+    crc: String,
+    symbol: String,
+    provider: String,
+    importers: usize,
+    examples: String,
+}
+
+fn read_consumer_manifest(path: &Path) -> Result<Vec<ConsumerEntry>> {
+    let content = fs::read_to_string(path)
+        .map_err(|err| anyhow!("Cannot read consumer manifest {}: {err}", path.display()))?;
+    let mut entries = Vec::new();
+    for (index, line) in content.lines().enumerate() {
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() < 4 {
+            return Err(anyhow!(
+                "{}:{}: expected crc, symbol, provider and importer count",
+                path.display(),
+                index + 1
+            ));
+        }
+        let importers = fields[3].parse().map_err(|_| {
+            anyhow!(
+                "{}:{}: importer count {:?} is not a number",
+                path.display(),
+                index + 1,
+                fields[3]
+            )
+        })?;
+        entries.push(ConsumerEntry {
+            crc: fields[0].to_string(),
+            symbol: fields[1].to_string(),
+            provider: fields[2].to_string(),
+            importers,
+            examples: fields.get(4).copied().unwrap_or_default().to_string(),
+        });
+    }
+    if entries.is_empty() {
+        return Err(anyhow!(
+            "Consumer manifest {} holds no entries",
+            path.display()
+        ));
+    }
+    Ok(entries)
+}
+
+/// Checks the build against the symbols the stock vendor modules import.
+///
+/// Every module records, in its `__versions` section, the CRC it expects for each
+/// symbol it imports; a mismatch makes it refuse to load with "disagrees about
+/// version of symbol". The baseline check compares against a reference build of
+/// this same tree, so a self-consistent change can satisfy it -- as the vendored
+/// LZ4 stack did, moving thirteen CRCs while still matching its own baseline.
+/// This check states the other half of the contract: what the modules already on
+/// the device require. Only rows the stock kernel provided are enforced; symbols
+/// that came from another module, or from nowhere at all, are not ours to keep.
+fn verify_stock_module_abi(kernel_source_path: &Path, baseline: &AbiBaseline) -> Result<()> {
+    let relative = match baseline.consumer_manifest.as_deref() {
+        Some(relative) => relative,
+        None => return Ok(()),
+    };
+    let entries = read_consumer_manifest(&kernel_source_path.join(relative))?;
+    let built = read_kernel_symvers(kernel_source_path)?;
+
+    let demanded: Vec<&ConsumerEntry> = entries
+        .iter()
+        .filter(|entry| entry.provider == "vmlinux")
+        .collect();
+
+    let mut changed = Vec::new();
+    let mut gone = Vec::new();
+    for entry in &demanded {
+        match built.get(&entry.symbol) {
+            None => gone.push(*entry),
+            Some(crc) if crc != &entry.crc => changed.push((*entry, crc.clone())),
+            Some(_) => {}
+        }
+    }
+    // A move may still be deliberate; naming the symbols keeps it reviewable.
+    changed.retain(|(entry, _)| !baseline.allowed_crc_symbols.contains(&entry.symbol));
+
+    println!(
+        "Stock module ABI {relative}: {} symbol(s) demanded by the vendor modules, {} CRC mismatch, {} no longer exported",
+        demanded.len(),
+        changed.len(),
+        gone.len()
+    );
+    for (entry, got) in changed.iter().take(ABI_REPORT_LIMIT) {
+        println!(
+            "  CRC {}: modules need {}, build exports {} ({} importer(s): {})",
+            entry.symbol, entry.crc, got, entry.importers, entry.examples
+        );
+    }
+    for entry in gone.iter().take(ABI_REPORT_LIMIT) {
+        println!(
+            "  MISSING {}: {} importer(s) ({}) stop loading",
+            entry.symbol, entry.importers, entry.examples
+        );
+    }
+
+    if changed.is_empty() && gone.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "Stock vendor modules would refuse to load: {} symbol(s) changed CRC, {} no longer exported",
+        changed.len(),
+        gone.len()
+    ))
+}
+
+/// Reports fragment entries that the resolved config does not carry.
+///
+/// Returns `(key, requested)` for every entry whose value is absent from the final
+/// `.config`, which means Kconfig dropped it or recomputed it from something else.
+fn unapplied_fragment_entries(
+    final_config: &str,
+    requested: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut present: HashMap<&str, &str> = HashMap::new();
+    for line in final_config.lines() {
+        if let Some((key, value)) = line.split_once('=') {
+            present.insert(key.trim(), value.trim());
+        }
+    }
+
+    requested
+        .iter()
+        .filter(|(key, value)| {
+            // `CONFIG_X=n` is the fragment's way of saying "not set", and Kconfig
+            // writes that as either `# CONFIG_X is not set` or `CONFIG_X=n`.
+            let expected = present.get(key.as_str()).copied().unwrap_or("n");
+            expected != value.as_str()
+        })
+        .cloned()
+        .collect()
+}
+
+fn report_unapplied_fragment_entries(final_config: &Path, fragment_path: &Path) -> Result<()> {
+    let fragment = fs::read_to_string(fragment_path)
+        .map_err(|err| anyhow!("Cannot read {}: {err}", fragment_path.display()))?;
+    let entries = parse_kconfig_fragment(&fragment, fragment_path)?;
+    let config = fs::read_to_string(final_config)
+        .map_err(|err| anyhow!("Cannot read {}: {err}", final_config.display()))?;
+
+    let dropped = unapplied_fragment_entries(&config, &entries);
+    if dropped.is_empty() {
+        println!(
+            "All {} tuning entries are present in the resolved config",
+            entries.len()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{} of {} tuning entries were not applied as written (dropped or recomputed):",
+        dropped.len(),
+        entries.len()
+    );
+    for (key, value) in &dropped {
+        println!("  {key}={value} -> not in the final config");
+    }
+    Ok(())
+}
+
+pub struct BuildOptions {
+    pub project_key: String,
+    pub branch: String,
+    pub do_release: bool,
+    pub custom_localversion: Option<String>,
+    pub bakasu_setup_arg: Option<String>,
+    pub apply_susfs: bool,
+    pub apply_bbg: bool,
+    pub apply_hybridmount: bool,
+    /// Overrides the project's `kconfig_fragment` for one run, so a tuning profile
+    /// can be graded without editing `configs/projects.json`.
+    pub kconfig_fragment: Option<String>,
+    /// Overrides the project's `lto` setting for one run.
+    pub lto: Option<String>,
+}
+
+pub fn handle_build(options: BuildOptions) -> Result<()> {
+    let BuildOptions {
+        project_key,
+        branch,
+        do_release,
+        custom_localversion,
+        bakasu_setup_arg,
+        apply_susfs,
+        apply_bbg,
+        apply_hybridmount,
+        kconfig_fragment: kconfig_fragment_override,
+        lto: lto_override,
+    } = options;
     let proj = load_project(&project_key)?;
 
     let kernel_source_path = PathBuf::from("kernel_source");
@@ -1121,7 +2646,18 @@ pub fn handle_build(
     }
 
     let target_soc_str = project_key.split('_').nth(1).unwrap_or("unknown");
-    let is_sm8850 = target_soc_str == "sm8850";
+    let is_gki_612 = uses_gki_612_pipeline(&project_key, &proj);
+    let is_pixel4 = crate::pixel4::is_pixel4(proj.build_style.as_deref());
+    if is_pixel4 && !is_bakasu_variant(&branch) {
+        return Err(anyhow!(
+            "Pixel 4 requires the bakasu variant (source branch may be selected separately)"
+        ));
+    }
+    if is_pixel4 && (apply_bbg || !apply_hybridmount) {
+        return Err(anyhow!(
+            "Pixel 4 requires Hybrid Mount and does not support Baseband Guard"
+        ));
+    }
 
     let wrapper_dir = env::current_dir()?.join(".compiler_wrappers");
     let _ = fs::create_dir_all(&wrapper_dir);
@@ -1167,14 +2703,19 @@ pub fn handle_build(
 
             let extract_script = r#"
             set -e
+            if command -v pigz >/dev/null 2>&1; then
+                DECOMPRESS_PROG=pigz
+            else
+                DECOMPRESS_PROG=gzip
+            fi
             if ls *.tar.gz.[0-9]* 1> /dev/null 2>&1; then
-                cat *.tar.gz.* | tar -zxf - --warning=no-unknown-keyword -C ..
+                cat *.tar.gz.* | tar -xf - --use-compress-program="$DECOMPRESS_PROG" --warning=no-unknown-keyword -C ..
             elif ls *part_aa* 1> /dev/null 2>&1 || ls *_aa.tar.gz 1> /dev/null 2>&1 || ls *.tar.gz.aa 1> /dev/null 2>&1; then
-                cat *.tar.gz | tar -zxf - --warning=no-unknown-keyword -C ..
+                cat *.tar.gz | tar -xf - --use-compress-program="$DECOMPRESS_PROG" --warning=no-unknown-keyword -C ..
             else
                 if ls *.tar.gz 1> /dev/null 2>&1; then
                     for tarball in *.tar.gz; do
-                        tar -zxf "$tarball" --warning=no-unknown-keyword -C ..
+                        tar -xf "$tarball" --use-compress-program="$DECOMPRESS_PROG" --warning=no-unknown-keyword -C ..
                     done
                 fi
                 if ls *.tar.xz 1> /dev/null 2>&1; then
@@ -1201,6 +2742,13 @@ pub fn handle_build(
 
             fs::remove_dir_all(tc_download_dir)?;
         }
+    }
+
+    if is_pixel4 && !toolchain_paths_ready(&toolchain_base, &proj) {
+        return Err(anyhow!(
+            "Pixel 4 LLVM 12 toolchain is missing at {}; refusing to use the host compiler",
+            toolchain_base.display()
+        ));
     }
 
     let mut build_env = HashMap::new();
@@ -1248,7 +2796,7 @@ pub fn handle_build(
     build_env.insert("TZ".to_string(), "Asia/Hong_Kong".to_string());
 
     let mut kcflags = "-O2 -pipe -Wno-error -D__ANDROID_COMMON_KERNEL__".to_string();
-    if is_sm8850 {
+    if is_gki_612 {
         if let Ok(common_real_path) = fs::canonicalize(&kernel_source_path)
             && let Some(root_real_path) = common_real_path.parent()
         {
@@ -1310,80 +2858,90 @@ pub fn handle_build(
         );
     }
 
-    let resukisu_setup_arg = resukisu_setup_arg
+    let bakasu_setup_arg = bakasu_setup_arg
         .as_deref()
         .map(str::trim)
         .filter(|arg| !arg.is_empty())
         .unwrap_or("main");
 
-    let is_resukisu_build = is_resukisu_variant(&branch)
-        || proj
-            .supported_ksu
-            .as_ref()
-            .map_or(false, |ksus| ksus.iter().any(|k| is_resukisu_variant(k)));
-
-    let setup_url = if is_resukisu_build {
-        Some((
-            "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh",
-            resukisu_setup_arg,
-        ))
-    } else {
-        None
+    let setup_url = match branch.as_str() {
+        _ if is_bakasu_variant(&branch) => Some((
+            "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh",
+            bakasu_setup_arg,
+        )),
+        _ => None,
     };
 
     if let Some((url, arg)) = setup_url {
-        let cmd = format!("curl -LSs '{}' | bash -s {}", url, arg);
-        run_cmd(&["bash", "-c", &cmd], Some(&kernel_source_path), false)?;
+        run_setup_script(url, Some(arg), &kernel_source_path)?;
+        integrate_bakasu_hooks(&kernel_source_path, &project_key, &proj.defconfig, None)?;
+    }
 
-        let selinux_hide_c = kernel_source_path.join("KernelSU/kernel/feature/selinux_hide.c");
-        if selinux_hide_c.exists() {
-            if let Ok(content) = fs::read_to_string(&selinux_hide_c) {
-                if content.contains("rwlock_init(&fake_state.ss->policy_rwlock);")
-                    && !content.contains("KERNEL_VERSION(5, 10, 0)")
-                {
-                    let fixed = content.replace(
-                        "rwlock_init(&fake_state.ss->policy_rwlock);",
-                        "#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)\n    rwlock_init(&fake_state.ss->policy_rwlock);\n#endif",
-                    );
-                    let _ = fs::write(&selinux_hide_c, fixed);
-                    println!("Applied fix for policy_rwlock in KernelSU/kernel/feature/selinux_hide.c");
-                }
-            }
-        }
+    if apply_susfs {
+        let susfs = proj
+            .susfs
+            .as_ref()
+            .ok_or_else(|| anyhow!("Project {} does not define a SuSFS source", project_key))?;
+        apply_susfs_overlay(&kernel_source_path, &proj.defconfig, susfs)?;
     }
 
     let mut feature_suffixes = Vec::new();
     if apply_susfs {
-        if is_resukisu_build {
-            let susfs = proj
-                .susfs
-                .as_ref()
-                .ok_or_else(|| anyhow!("Project {} does not define a SuSFS source", project_key))?;
-            apply_susfs_overlay(&kernel_source_path, susfs)?;
-            feature_suffixes.push("susfs".to_string());
-        } else {
-            println!(
-                "Skipping SuSFS for branch '{}': SuSFS is only enabled for ReSukiSU builds.",
-                branch
-            );
-        }
+        feature_suffixes.push("susfs".to_string());
+    }
+    if apply_hybridmount {
+        apply_hybridmount_overlay(&kernel_source_path, &proj.defconfig)?;
+        feature_suffixes.push("hybridmount".to_string());
+    } else {
+        set_hybridmount_config(&kernel_source_path, &proj.defconfig, false)?;
     }
 
     if apply_bbg {
-        apply_bbg_overlay(&kernel_source_path, &proj, proj.bbg.as_ref())?;
+        let bbg = require_bbg_config(&project_key, proj.bbg.as_ref())?;
+        apply_bbg_overlay(&kernel_source_path, &proj, Some(bbg))?;
         feature_suffixes.push("bbg".to_string());
     }
 
-    let kernel_version = capture_make_output(&kernel_source_path, "kernelversion", is_sm8850)?;
+    // A one-run override lets a tuning profile be graded in CI without editing the
+    // project entry, which is what makes staged ABI experiments practical.
+    let kconfig_fragment = kconfig_fragment_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| proj.kconfig_fragment.clone());
 
+    if let Some(fragment) = kconfig_fragment.as_deref() {
+        apply_kconfig_fragment(&kernel_source_path, &proj.defconfig, fragment)?;
+        feature_suffixes.push("tuning".to_string());
+    }
+
+    let kernel_version = capture_make_output(&kernel_source_path, "kernelversion", is_gki_612)?;
+    validate_kernel_version(
+        &project_key,
+        proj.expected_kernel_version.as_deref(),
+        &kernel_version,
+    )?;
+
+    // The short sha goes straight into `localversion`, so a failure to read it used to
+    // ship a kernel named `...-gunknown-4k`: the release identity and the ABI baseline
+    // both key off that string, and a version nobody can trace back to a commit is worse
+    // than no release at all.
     let short_sha = run_cmd(
         &["git", "rev-parse", "--short=12", "HEAD"],
         Some(&kernel_source_path),
         true,
-    )?
-    .unwrap_or_else(|| "unknown".to_string())
-    .trim()
-    .to_string();
+    )
+    .context("Failed to read the kernel source HEAD commit")?
+    .map(|sha| sha.trim().to_string())
+    .filter(|sha| !sha.is_empty())
+    .ok_or_else(|| {
+        anyhow!(
+            "Could not determine the kernel source commit in {}; refusing to build a \
+             localversion with an unknown commit",
+            kernel_source_path.display()
+        )
+    })?;
 
     let mut make_args = vec![
         "O=out",
@@ -1405,6 +2963,36 @@ pub fn handle_build(
 
     let soc_arg = format!("TARGET_SOC={}", target_soc_str);
     make_args.push(&soc_arg);
+    if is_pixel4 {
+        run_cmd(
+            &["python3", "scripts/tests/pixel4-audio-pdr.py"],
+            Some(&kernel_source_path),
+            false,
+        )?;
+        run_cmd(
+            &["python3", "scripts/tests/pixel4-builtin-wlan.py"],
+            Some(&kernel_source_path),
+            false,
+        )?;
+        // This 4.14 tree predates LLVM=1 and uses GNU binutils for AArch64.
+        make_args.retain(|arg| {
+            !arg.starts_with("LLVM")
+                && !arg.starts_with("HOSTLD=")
+                && !arg.starts_with("AR=")
+                && !arg.starts_with("NM=")
+                && !arg.starts_with("OBJCOPY=")
+                && !arg.starts_with("OBJDUMP=")
+                && !arg.starts_with("OBJSIZE=")
+                && !arg.starts_with("READELF=")
+                && !arg.starts_with("STRIP=")
+        });
+        make_args.extend_from_slice(&[
+            "CLANG_TRIPLE=aarch64-linux-gnu-",
+            "CROSS_COMPILE=aarch64-linux-gnu-",
+            "CROSS_COMPILE_ARM32=arm-linux-gnueabi-",
+            "HOSTCFLAGS=-fcommon",
+        ]);
+    }
 
     make_args.push(&rustc_arg);
     make_args.push(&hostrustc_arg);
@@ -1415,21 +3003,23 @@ pub fn handle_build(
     fs::write(kernel_source_path.join("protected_exports_list"), "")?;
 
     let git_exclude_path = kernel_source_path.join(".git/info/exclude");
-    let mut exclude_data = fs::read_to_string(&git_exclude_path).unwrap_or_default();
+    if let Some(parent) = git_exclude_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut exclude_data = read_text_allow_missing(&git_exclude_path)?;
     exclude_data.push_str("\nprotected_module_names_list\nprotected_exports_list\n");
-    let _ = fs::write(git_exclude_path, exclude_data);
+    fs::write(&git_exclude_path, exclude_data)?;
 
     build_env.insert("CC".to_string(), cc_cmd.clone());
     build_env.insert("HOSTCC".to_string(), cc_cmd.clone());
     build_env.insert("LD".to_string(), "ld.lld".to_string());
     build_env.insert("HOSTLD".to_string(), "ld.lld".to_string());
-    build_env.insert("KBUILD_BUILD_TIMESTAMP".to_string(), chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string());
 
     let build_variant_suffix = variant_suffix(&branch);
 
     let mut localversion = if let Some(ref custom) = custom_localversion {
         let custom = custom.trim();
-        if is_sm8850 {
+        if is_gki_612 {
             format!("-{}", custom.trim_start_matches('-'))
         } else {
             custom.to_string()
@@ -1437,6 +3027,16 @@ pub fn handle_build(
     } else {
         format!("{}-{}", proj.localversion_base, build_variant_suffix)
     };
+
+    if is_pixel4 {
+        localversion = crate::pixel4::localversion(&localversion, &short_sha)?;
+        if kernel_version.len() + localversion.len() > 64 {
+            return Err(anyhow!(
+                "Pixel 4 kernel release exceeds the UTS length limit"
+            ));
+        }
+        println!("Pixel 4 kernel release: {}{}", kernel_version, localversion);
+    }
 
     if target_soc_str == "sm8750" {
         let sm8750_base = custom_localversion
@@ -1454,12 +3054,12 @@ pub fn handle_build(
         );
     }
 
-    if is_sm8850 {
+    if is_gki_612 {
         if custom_localversion.is_none() {
             if project_key == "nezha_sm8850" {
                 localversion = format!(
-                    "{}-SuSFS-4k",
-                    proj.localversion_base
+                    "{}-{}-g{}-4k",
+                    proj.localversion_base, build_variant_suffix, short_sha
                 );
             } else {
                 localversion = format!("{}-g{}-4k", proj.localversion_base, short_sha);
@@ -1468,14 +3068,14 @@ pub fn handle_build(
         let _ = fs::write(kernel_source_path.join(".scmversion"), "");
         make_args.push("LOCALVERSION_AUTO=n");
         build_env.insert("LOCALVERSION_AUTO".to_string(), "n".to_string());
-        apply_sm8850_localversion(&kernel_source_path, &proj.defconfig, &localversion)?;
+        apply_gki_localversion(&kernel_source_path, &proj.defconfig, &localversion)?;
     }
 
-    if is_sm8850 {
-        prepare_sm8850_build(&kernel_source_path, &proj, setup_url.is_some())?;
+    if is_gki_612 {
+        prepare_gki_build(&kernel_source_path, &proj, setup_url.is_some())?;
     }
 
-    if is_sm8850 {
+    if is_gki_612 {
         println!("Testing Environment and rust_is_available.sh...");
         let mut cmd = std::process::Command::new("bash");
         cmd.arg("-c").arg("source ./_setup_env.sh 2>/dev/null || true && echo '=== Toolchain Versions ===' && $CC --version | head -n1 && $RUSTC -V && bindgen --version && pahole --version && echo '==========================' && sh scripts/rust_is_available.sh -v");
@@ -1497,10 +3097,35 @@ pub fn handle_build(
         &build_env,
         &make_args,
         &[&proj.defconfig],
-        is_sm8850,
+        is_gki_612,
     )?;
 
     let mut disable_configs = vec!["TRIM_UNUSED_KSYMS"];
+    if is_pixel4 {
+        disable_configs.extend_from_slice(&[
+            "LTO",
+            "LTO_CLANG",
+            "CFI",
+            "CFI_CLANG",
+            "CFI_PERMISSIVE",
+            "KSU_TRACEPOINT_HOOK",
+        ]);
+        update_kconfig_file(
+            &kernel_source_path.join("out/.config"),
+            &[
+                ("CONFIG_LOCALVERSION", "\"\""),
+                ("CONFIG_KSU", "y"),
+                ("CONFIG_KSU_MANUAL_HOOK", "y"),
+                ("CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK", "y"),
+                ("CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK", "y"),
+                ("CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK", "y"),
+                ("CONFIG_HYBRIDMOUNT", "y"),
+                ("CONFIG_QCA_CLD_WLAN", "y"),
+                ("CONFIG_TMPFS_XATTR", "y"),
+                ("CONFIG_KEYS", "y"),
+            ],
+        )?;
+    }
     if let Some(disables) = &proj.disable_security {
         for d in disables {
             disable_configs.push(d);
@@ -1521,7 +3146,19 @@ pub fn handle_build(
         )?;
     }
 
-    if let Some(lto) = &proj.lto {
+    if setup_url.is_some() {
+        update_kconfig_file(
+            &kernel_source_path.join("out/.config"),
+            COMMON_KSU_KCONFIG_ENTRIES,
+        )?;
+    }
+
+    let lto_setting = lto_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or(proj.lto.as_deref());
+    if let Some(lto) = lto_setting {
         if lto == "thin" {
             run_cmd(
                 &[
@@ -1574,14 +3211,50 @@ pub fn handle_build(
         &build_env,
         &make_args,
         &["olddefconfig"],
-        is_sm8850,
+        is_gki_612,
     )?;
 
-    if !is_sm8850 {
+    let final_config = kernel_source_path.join("out/.config");
+    if setup_url.is_some() {
+        integrate_bakasu_hooks(
+            &kernel_source_path,
+            &project_key,
+            &proj.defconfig,
+            Some(&final_config),
+        )?;
+        validate_kconfig_entries(&final_config, COMMON_KSU_KCONFIG_ENTRIES)?;
+    }
+    // Report dropped fragment entries before the ABI checks: if a tuning experiment
+    // silently applied nothing, that is the first thing worth knowing.
+    if let Some(fragment) = kconfig_fragment.as_deref() {
+        report_unapplied_fragment_entries(&final_config, &kernel_source_path.join(fragment))?;
+    }
+    if is_pixel4 {
+        validate_kconfig_entries(&final_config, COMMON_KSU_KCONFIG_ENTRIES)?;
+        validate_kconfig_entries(
+            &final_config,
+            &[
+                ("CONFIG_KSU", "y"),
+                ("CONFIG_KSU_MANUAL_HOOK", "y"),
+                ("CONFIG_HYBRIDMOUNT", "y"),
+                ("CONFIG_QCA_CLD_WLAN", "y"),
+                ("CONFIG_TMPFS_XATTR", "y"),
+                ("CONFIG_KEYS", "y"),
+            ],
+        )?;
+    }
+    if is_gki_612 {
+        validate_kconfig_entries(&final_config, GKI_CUSTOM_KCONFIG_ENTRIES)?;
+        if setup_url.is_some() {
+            validate_kconfig_entries(&final_config, COMMON_KSU_KCONFIG_ENTRIES)?;
+        }
+    }
+
+    if !is_gki_612 {
         patch_setlocalversion_remove_dirty(&kernel_source_path)?;
     }
 
-    if custom_localversion.is_some() && !is_sm8850 {
+    if custom_localversion.is_some() && !is_gki_612 {
         let _ = fs::write(kernel_source_path.join(".scmversion"), "");
         make_args.push("LOCALVERSION_AUTO=n");
         build_env.insert("LOCALVERSION_AUTO".to_string(), "n".to_string());
@@ -1589,7 +3262,7 @@ pub fn handle_build(
 
     let localversion_arg = format!("LOCALVERSION={}", localversion);
 
-    if !is_sm8850 {
+    if !is_gki_612 {
         if uses_file_localversion(&proj) {
             let _ = fs::write(
                 kernel_source_path.join("localversion"),
@@ -1607,10 +3280,13 @@ pub fn handle_build(
         build_env.insert("LOCALVERSION".to_string(), "".to_string());
     }
 
-    let threads = run_cmd(&["nproc"], None, true)?.unwrap().trim().to_string();
-    let jobs = format!("-j{}", threads);
+    let detected_cpus =
+        run_cmd(&["nproc"], None, true)?.context("nproc did not return the available CPU count")?;
+    let override_jobs = env::var("KOKUBAN_MAKE_JOBS").ok();
+    let jobs = crate::build_jobs::make_jobs_arg(override_jobs.as_deref(), &detected_cpus)
+        .context("KOKUBAN_MAKE_JOBS or the detected CPU count must be a positive integer")?;
 
-    if is_sm8850 {
+    if is_gki_612 {
         let mut cmd_str = format!(
             "source ./_setup_env.sh 2>/dev/null || true && make {} Image",
             jobs
@@ -1624,13 +3300,34 @@ pub fn handle_build(
             &build_env,
         )?;
     } else {
-        let mut build_cmd = vec!["make", &jobs, "Image", "modules"];
+        let targets = if is_pixel4 {
+            vec!["Image.lz4", "modules"]
+        } else {
+            vec!["Image", "modules"]
+        };
+        let mut build_cmd = vec!["make", &jobs];
+        build_cmd.extend_from_slice(&targets);
         build_cmd.extend_from_slice(&make_args);
         run_cmd_with_env(&build_cmd, Some(&kernel_source_path), &build_env)?;
     }
 
     if uses_file_localversion(&proj) {
         fs::write(kernel_source_path.join("localversion"), "")?;
+    }
+
+    // The baseline check runs first: it prints the full per-symbol report, which is
+    // what makes an experiment diagnosable. The canary list is the cheaper fallback
+    // for projects that ship no baseline.
+    if let Some(baseline) = &proj.abi_baseline {
+        verify_abi_baseline(&kernel_source_path, baseline)?;
+        println!("Kernel ABI baseline check passed");
+        verify_stock_module_abi(&kernel_source_path, baseline)?;
+        println!("Stock module ABI check passed");
+    }
+
+    if let Some(gates) = &proj.abi_symbol_gates {
+        verify_abi_symbol_gates(&kernel_source_path, gates)?;
+        println!("Kernel ABI gate passed for {} symbol(s)", gates.len());
     }
 
     prepare_anykernel_worktree(Path::new("AnyKernel3"), offline)?;
@@ -1640,12 +3337,33 @@ pub fn handle_build(
         apply_anykernel_config(Path::new("AnyKernel3"), &anykernel_config)?;
     }
 
-    let image_path = kernel_source_path.join("out/arch/arm64/boot/Image");
+    let image_name = if is_pixel4 { "Image.lz4" } else { "Image" };
+    let image_path = kernel_source_path
+        .join("out/arch/arm64/boot")
+        .join(image_name);
     if !image_path.exists() {
         return Err(anyhow!("Image not found at {:?}", image_path));
     }
 
-    fs::copy(image_path, "AnyKernel3/Image")?;
+    fs::copy(image_path, Path::new("AnyKernel3").join(image_name))?;
+
+    if is_pixel4 {
+        run_cmd(
+            &[
+                "python3",
+                "scripts/pixel4-builtin.py",
+                "--out",
+                kernel_source_path
+                    .join("out")
+                    .to_str()
+                    .ok_or_else(|| anyhow!("Invalid Pixel 4 output path"))?,
+                "--anykernel",
+                "AnyKernel3",
+            ],
+            None,
+            false,
+        )?;
+    }
 
     let hkt = FixedOffset::east_opt(8 * 3600).ok_or_else(|| anyhow!("Invalid HKT offset"))?;
     let date_str = Utc::now()
@@ -1694,12 +3412,12 @@ pub fn handle_build(
 
     if do_release {
         let release_tag = format!(
-            "{}{}-{}",
-            zip_prefix, feature_suffix, date_str
+            "{}-{}{}-{}",
+            zip_prefix, build_variant_suffix, feature_suffix, date_str
         );
         let release_title = format!(
-            "{} {} Build ({})",
-            zip_prefix, feature_suffix, date_str
+            "{} {}{} Build ({})",
+            zip_prefix, build_variant_suffix, feature_suffix, date_str
         );
 
         if Path::new(&final_zip_name).exists() {

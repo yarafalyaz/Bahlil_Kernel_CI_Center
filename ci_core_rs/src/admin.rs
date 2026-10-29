@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Duration, Utc};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -8,7 +9,7 @@ use crate::config::ProjectConfig;
 use crate::local::{default_local_root, ensure_local_host, sanitize_path_component};
 use crate::settings::{self, Preset};
 use crate::utils::{cache_file_name, file_sha256};
-use crate::utils::{load_project, load_projects};
+use crate::utils::{load_anykernel_configs, load_project, load_projects};
 
 fn dir_size(path: &Path) -> u64 {
     let Ok(metadata) = fs::symlink_metadata(path) else {
@@ -57,6 +58,40 @@ fn remove_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Reject a user-supplied path component that would resolve outside `root`.
+///
+/// `sanitize_path_component` already replaces separators, but `.`/`..` and absolute paths
+/// survive in other call paths, so validate the component shape and confirm the resolved
+/// target still sits under the cache root before anything is deleted.
+fn ensure_within(root: &Path, component: &str) -> Result<()> {
+    let candidate = Path::new(component);
+    let mut parts = candidate.components();
+    let single_segment = !candidate.is_absolute()
+        && matches!(parts.next(), Some(std::path::Component::Normal(_)))
+        && parts.next().is_none();
+
+    if !single_segment {
+        return Err(anyhow!(
+            "Invalid project name {:?}: it must be a single path segment without separators or '.'/'..'",
+            component
+        ));
+    }
+
+    let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let resolved = fs::canonicalize(root.join(component))
+        .unwrap_or_else(|_| root.join(component).to_path_buf());
+
+    if !resolved.starts_with(&root) {
+        return Err(anyhow!(
+            "Refusing to clean {:?}: it resolves outside the cache root {}",
+            component,
+            root.display()
+        ));
+    }
+
+    Ok(())
+}
+
 fn project_values() -> Result<Vec<(String, ProjectConfig)>> {
     let projects = load_projects()?;
     let mut values = Vec::new();
@@ -89,14 +124,6 @@ pub fn handle_features(project: Option<String>) -> Result<()> {
         println!("project={}", project);
         println!("repo={}", proj.repo);
         println!("defconfig={}", proj.defconfig);
-        if let Some(susfs) = proj.susfs {
-            println!("susfs=enabled");
-            println!("susfs_repo={}", susfs.repo);
-            println!("susfs_branch={}", susfs.branch);
-            println!("susfs_patch={}", susfs.patch_path);
-        } else {
-            println!("susfs=missing");
-        }
         if let Some(bbg) = proj.bbg {
             println!("bbg=enabled");
             println!(
@@ -106,33 +133,149 @@ pub fn handle_features(project: Option<String>) -> Result<()> {
                 })
             );
         } else {
-            println!("bbg=missing");
+            println!("bbg=disabled");
         }
+        println!("hybridmount=enabled");
         return Ok(());
     }
 
     for (key, proj) in project_values()? {
         println!(
-            "{}\tsusfs={}\tbbg={}",
+            "{}\tbbg={}\thybridmount=enabled",
             key,
-            if proj.susfs.is_some() {
-                "enabled"
-            } else {
-                "missing"
-            },
             if proj.bbg.is_some() {
                 "enabled"
             } else {
-                "missing"
+                "disabled"
             }
         );
     }
     Ok(())
 }
 
-pub fn handle_validate() -> Result<()> {
+/// Cross-reference checks the non-empty pass above cannot see.
+///
+/// Every one of these failures is currently invisible until a build reaches the step that
+/// consumes the value, which is the worst possible time to learn that an AnyKernel key is
+/// misspelled or a digest is missing. Kept as a pure function of the loaded config so the
+/// rules can be tested without a repository on disk.
+fn validate_project_cross_references(
+    projects: &[(String, ProjectConfig)],
+    anykernel_keys: &BTreeSet<String>,
+) -> (Vec<String>, Vec<String>) {
     let mut errors = Vec::new();
-    for (key, proj) in project_values()? {
+    let mut warnings = Vec::new();
+
+    // `handle_notify` decides which project a release tag belongs to with
+    // `tag_name.starts_with(prefix)` while iterating an unordered map, so an equal prefix --
+    // or one that is a prefix of another -- makes that lookup ambiguous and dependent on
+    // iteration order.
+    let prefixes: Vec<(&str, &str)> = projects
+        .iter()
+        .filter_map(|(key, proj)| {
+            proj.zip_name_prefix
+                .as_deref()
+                .map(str::trim)
+                .filter(|prefix| !prefix.is_empty())
+                .map(|prefix| (prefix, key.as_str()))
+        })
+        .collect();
+
+    for (index, (left, left_key)) in prefixes.iter().enumerate() {
+        for (right, right_key) in &prefixes[index + 1..] {
+            if left == right {
+                errors.push(format!(
+                    "{left_key}/{right_key}: duplicate zip_name_prefix {left:?}; release-tag matching is ambiguous"
+                ));
+            } else if left.starts_with(right) || right.starts_with(left) {
+                warnings.push(format!(
+                    "{left_key}/{right_key}: zip_name_prefix {left:?} and {right:?} -- one is a prefix of the other, so tag matching depends on iteration order"
+                ));
+            }
+        }
+    }
+
+    for (key, proj) in projects {
+        if let Some(reference) = proj
+            .anykernel_config
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            && !anykernel_keys.contains(reference)
+        {
+            errors.push(format!(
+                "{key}: anykernel_config {reference:?} is not defined in configs/anykernel_configs.json"
+            ));
+        }
+
+        let urls = proj.toolchain_urls.as_deref().unwrap_or_default();
+        let digests = proj.toolchain_sha256.as_ref();
+
+        for url in urls {
+            if !digests.is_some_and(|digests| digests.contains_key(url)) {
+                warnings.push(format!(
+                    "{key}: toolchain_sha256 has no digest for {url}; the download is unverified"
+                ));
+            }
+        }
+
+        if let Some(digests) = digests {
+            for (url, digest) in digests {
+                if !urls.contains(url) {
+                    errors.push(format!(
+                        "{key}: toolchain_sha256 names {url:?}, which is not in toolchain_urls (stale or misspelled)"
+                    ));
+                }
+                if digest.len() != 64 || !digest.chars().all(|c| c.is_ascii_hexdigit()) {
+                    errors.push(format!(
+                        "{key}: toolchain_sha256[{url:?}] is not a 64-character hex digest"
+                    ));
+                }
+            }
+        }
+
+        // These paths are resolved inside the checked-out kernel source, so an absolute path
+        // or a parent component could silently point outside the tree being graded.
+        let relative_paths = [
+            (
+                "abi_baseline.path",
+                proj.abi_baseline.as_ref().map(|b| b.path.as_str()),
+            ),
+            (
+                "abi_baseline.consumer_manifest",
+                proj.abi_baseline
+                    .as_ref()
+                    .and_then(|b| b.consumer_manifest.as_deref()),
+            ),
+            ("kconfig_fragment", proj.kconfig_fragment.as_deref()),
+        ];
+
+        for (label, path) in relative_paths {
+            if let Some(path) = path.map(str::trim).filter(|value| !value.is_empty())
+                && !is_kernel_relative_path(path)
+            {
+                errors.push(format!(
+                    "{key}: {label} must be relative and stay inside the kernel source, got {path:?}"
+                ));
+            }
+        }
+    }
+
+    (errors, warnings)
+}
+
+fn is_kernel_relative_path(path: &str) -> bool {
+    let path = Path::new(path);
+    !path.is_absolute()
+        && !path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+}
+
+pub fn handle_validate(strict: bool) -> Result<()> {
+    let mut errors = Vec::new();
+    let projects = project_values()?;
+    for (key, proj) in &projects {
         if proj.repo.trim().is_empty() {
             errors.push(format!("{key}: missing repo"));
         }
@@ -168,11 +311,21 @@ pub fn handle_validate() -> Result<()> {
         {
             errors.push(format!("{key}: missing toolchain_urls"));
         }
-        if proj.susfs.is_none() {
-            errors.push(format!("{key}: missing susfs"));
-        }
-        if proj.bbg.is_none() {
-            errors.push(format!("{key}: missing bbg"));
+    }
+
+    let anykernel_keys = load_anykernel_configs()?.into_keys().collect();
+    let (cross_errors, warnings) = validate_project_cross_references(&projects, &anykernel_keys);
+    errors.extend(cross_errors);
+
+    // Off by default: the current configuration has no toolchain digests recorded yet, and
+    // failing on that today would turn a missing safety net into a broken build. Opt in with
+    // `validate --strict` once the digests are filled in.
+    let warning_count = warnings.len();
+    if strict {
+        errors.extend(warnings);
+    } else {
+        for warning in &warnings {
+            eprintln!("warning: {warning}");
         }
     }
 
@@ -180,7 +333,11 @@ pub fn handle_validate() -> Result<()> {
         return Err(anyhow!(errors.join("\n")));
     }
 
-    println!("OK: project configuration is valid.");
+    if warning_count == 0 {
+        println!("OK: project configuration is valid.");
+    } else {
+        println!("OK: project configuration is valid, with {warning_count} warning(s) above.");
+    }
     Ok(())
 }
 
@@ -246,14 +403,10 @@ pub fn handle_cache_clean(
             let project =
                 project.ok_or_else(|| anyhow!("cache clean project requires --project"))?;
             let project_key = sanitize_path_component(&project);
+            ensure_within(&root, &project)?;
             remove_path(&root.join("builds").join(&project_key))?;
             remove_path(&root.join("artifacts").join(&project_key))?;
             remove_path(&root.join("logs").join(&project_key))?;
-            if project_key != project {
-                remove_path(&root.join("builds").join(&project))?;
-                remove_path(&root.join("artifacts").join(&project))?;
-                remove_path(&root.join("logs").join(&project))?;
-            }
             remove_path(
                 &root
                     .join("repos/kernels")
@@ -270,8 +423,8 @@ pub fn handle_cache_clean(
 pub fn handle_config_show() -> Result<()> {
     let settings = settings::load_settings()?;
     println!("config_file={}", settings::config_file()?.display());
-    println!("apply_susfs={}", settings.apply_susfs);
     println!("apply_bbg={}", settings.apply_bbg);
+    println!("apply_hybridmount={}", settings.apply_hybridmount);
     println!(
         "local_root={}",
         settings
@@ -397,36 +550,6 @@ pub fn handle_toolchain_checksums(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::thread;
-    use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
-
-    fn unique_temp_path(name: &str) -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("{name}-{unique}"))
-    }
-
-    #[test]
-    fn cache_prune_keeps_newest_artifacts() {
-        let root = unique_temp_path("kokuban-prune-test");
-        let project_dir = root.join("artifacts/test_project");
-        fs::create_dir_all(project_dir.join("old")).unwrap();
-        thread::sleep(StdDuration::from_millis(5));
-        fs::create_dir_all(project_dir.join("new")).unwrap();
-
-        handle_cache_prune(1, None, Some(root.clone())).unwrap();
-
-        assert!(!project_dir.join("old").exists());
-        assert!(project_dir.join("new").exists());
-        fs::remove_dir_all(root).unwrap();
-    }
-}
-
 pub fn handle_cache_prune(
     keep_artifacts: usize,
     older_than_days: Option<i64>,
@@ -456,7 +579,7 @@ pub fn handle_cache_prune(
             let modified: DateTime<Utc> = metadata.modified()?.into();
             entries.push((entry.path(), modified));
         }
-        entries.sort_by(|a, b| b.1.cmp(&a.1));
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.1));
 
         for (idx, (path, modified)) in entries.into_iter().enumerate() {
             let beyond_keep = idx >= keep_artifacts;
@@ -469,4 +592,224 @@ pub fn handle_cache_prune(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
+    use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_path(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{name}-{unique}"))
+    }
+
+    #[test]
+    fn cache_prune_keeps_newest_artifacts() {
+        let root = unique_temp_path("kokuban-prune-test");
+        let project_dir = root.join("artifacts/test_project");
+        fs::create_dir_all(project_dir.join("old")).unwrap();
+        thread::sleep(StdDuration::from_millis(5));
+        fs::create_dir_all(project_dir.join("new")).unwrap();
+
+        handle_cache_prune(1, None, Some(root.clone())).unwrap();
+
+        assert!(!project_dir.join("old").exists());
+        assert!(project_dir.join("new").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // A project name that escapes the cache root must never delete anything outside it.
+    #[test]
+    fn cache_clean_project_cannot_escape_root() {
+        let root = unique_temp_path("kokuban-clean-escape-test");
+        let victim = root.parent().unwrap().join(format!(
+            "kokuban-clean-victim-{}",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        fs::create_dir_all(&victim).unwrap();
+        fs::write(victim.join("KEEP.txt"), "keep").unwrap();
+
+        let escaped = format!("../../{}", victim.file_name().unwrap().to_string_lossy());
+        let result = handle_cache_clean("project".to_string(), Some(escaped), Some(root.clone()));
+
+        assert!(result.is_err(), "escaping project name must be rejected");
+        assert!(
+            victim.join("KEEP.txt").exists(),
+            "files outside the cache root must be left untouched"
+        );
+        let _ = fs::remove_dir_all(&victim);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // Every shape that is not exactly one plain path segment must be refused, including
+    // nested separators and the bare "." / ".." names that resolve to real directories.
+    #[test]
+    fn cache_clean_rejects_non_segment_project_names() {
+        for name in [".", "..", "a/b", "/abs/path", "a/../../b", "./x"] {
+            let root = unique_temp_path("kokuban-clean-shape-test");
+            fs::create_dir_all(&root).unwrap();
+
+            let result = handle_cache_clean(
+                "project".to_string(),
+                Some(name.to_string()),
+                Some(root.clone()),
+            );
+
+            assert!(
+                result.is_err(),
+                "project name {:?} must be rejected, not cleaned",
+                name
+            );
+            assert!(root.exists(), "root must survive rejected name {:?}", name);
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    fn project_with(key: &str, prefix: &str, ak3: &str) -> (String, ProjectConfig) {
+        let json = serde_json::json!({
+            "repo": format!("owner/{key}"),
+            "defconfig": "cfg_defconfig",
+            "localversion_base": "-android16-Kokuban-Test",
+            "zip_name_prefix": prefix,
+            "anykernel_config": ak3,
+            "toolchain_urls": ["https://example.com/tc.zip"],
+        });
+        (
+            key.to_string(),
+            serde_json::from_value(json).expect("project fixture must parse"),
+        )
+    }
+
+    fn ak3_keys(keys: &[&str]) -> BTreeSet<String> {
+        keys.iter().map(|key| key.to_string()).collect()
+    }
+
+    #[test]
+    fn cross_reference_accepts_a_consistent_project() {
+        let projects = vec![project_with("a_sm1", "A_Kernel", "canoe")];
+        let (errors, warnings) =
+            validate_project_cross_references(&projects, &ak3_keys(&["canoe"]));
+
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        // The fixture names one toolchain URL with no digest, which is a warning, not an error.
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("no digest"));
+    }
+
+    #[test]
+    fn cross_reference_rejects_an_unknown_anykernel_key() {
+        let projects = vec![project_with("a_sm1", "A_Kernel", "typo_key")];
+        let (errors, _) = validate_project_cross_references(&projects, &ak3_keys(&["canoe"]));
+
+        assert!(
+            errors.iter().any(|e| e.contains("typo_key")),
+            "an AnyKernel key absent from anykernel_configs.json must be an error: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn cross_reference_rejects_duplicate_and_overlapping_tag_prefixes() {
+        let duplicate = vec![
+            project_with("a_sm1", "Kernel", "canoe"),
+            project_with("b_sm2", "Kernel", "canoe"),
+        ];
+        let (errors, _) = validate_project_cross_references(&duplicate, &ak3_keys(&["canoe"]));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("duplicate zip_name_prefix")),
+            "identical prefixes make tag matching ambiguous: {errors:?}"
+        );
+
+        // Distinct but nested prefixes stay a warning: which project a tag resolves to then
+        // depends on map iteration order, which is the bug worth surfacing.
+        let nested = vec![
+            project_with("a_sm1", "Kernel", "canoe"),
+            project_with("b_sm2", "Kernel_Pro", "canoe"),
+        ];
+        let (errors, warnings) = validate_project_cross_references(&nested, &ak3_keys(&["canoe"]));
+        assert!(
+            errors.is_empty(),
+            "nested prefixes are not a hard error: {errors:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("prefix of the other")),
+            "nested prefixes must be flagged: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn cross_reference_rejects_absolute_and_bad_digest_values() {
+        let mut proj = project_with("a_sm1", "A_Kernel", "canoe").1;
+        proj.toolchain_sha256 = Some(std::collections::HashMap::from([(
+            "https://example.com/tc.zip".to_string(),
+            "not-a-digest".to_string(),
+        )]));
+        proj.abi_baseline = Some(crate::config::AbiBaseline {
+            path: "/abs/path/symvers".to_string(),
+            consumer_manifest: None,
+            ignore_prefixes: Vec::new(),
+            allow_crc_mismatch: 0,
+            allow_missing: 0,
+            allowed_missing_symbols: Vec::new(),
+            allowed_crc_symbols: Vec::new(),
+        });
+
+        let projects = vec![("a_sm1".to_string(), proj)];
+        let (errors, _) = validate_project_cross_references(&projects, &ak3_keys(&["canoe"]));
+
+        assert!(
+            errors.iter().any(|e| e.contains("64-character hex digest")),
+            "a malformed digest must be rejected: {errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("must be relative")),
+            "an absolute in-tree path must be rejected: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn cross_reference_rejects_paths_that_escape_with_parent_components() {
+        let mut proj = project_with("a_sm1", "A_Kernel", "canoe").1;
+        proj.kconfig_fragment = Some("Kokuban/../outside.fragment".to_string());
+
+        let projects = vec![("a_sm1".to_string(), proj)];
+        let (errors, _) = validate_project_cross_references(&projects, &ak3_keys(&["canoe"]));
+
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|error| error.contains("must be relative"))
+                .count(),
+            1,
+            "parent components must be rejected for every kernel-relative path: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn cross_reference_rejects_a_digest_for_an_undeclared_url() {
+        let mut proj = project_with("a_sm1", "A_Kernel", "canoe").1;
+        proj.toolchain_sha256 = Some(std::collections::HashMap::from([
+            ("https://example.com/tc.zip".to_string(), "a".repeat(64)),
+            ("https://example.com/stale.zip".to_string(), "b".repeat(64)),
+        ]));
+
+        let projects = vec![("a_sm1".to_string(), proj)];
+        let (errors, warnings) =
+            validate_project_cross_references(&projects, &ak3_keys(&["canoe"]));
+
+        assert!(
+            errors.iter().any(|e| e.contains("stale.zip")),
+            "a digest for a URL that is not declared must be rejected: {errors:?}"
+        );
+        assert!(
+            warnings.iter().all(|w| !w.contains("tc.zip")),
+            "a declared URL with a digest must not warn: {warnings:?}"
+        );
+    }
 }

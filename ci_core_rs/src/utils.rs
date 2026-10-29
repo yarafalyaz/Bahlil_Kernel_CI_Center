@@ -145,24 +145,71 @@ pub fn load_anykernel_config(config_key: &str) -> Result<AnyKernelConfig> {
 }
 
 pub fn normalize_variant_name(variant: &str) -> String {
-    variant.replace("sukisuultra", "resukisu")
+    match variant {
+        "resukisu" | "sukisuultra" => "bakasu".to_string(),
+        _ => variant.to_string(),
+    }
 }
 
 pub fn variant_suffix(variant: &str) -> String {
     match normalize_variant_name(variant).as_str() {
         "main" | "lkm" => "LKM".to_string(),
-        "resukisu" => "ReSuki".to_string(),
+        "bakasu" => "BakaSU".to_string(),
         _ => variant.to_uppercase(),
     }
 }
 
-pub fn is_resukisu_variant(variant: &str) -> bool {
-    normalize_variant_name(variant) == "resukisu"
+pub fn is_bakasu_variant(variant: &str) -> bool {
+    normalize_variant_name(variant) == "bakasu"
 }
 
 pub fn save_json<T: serde::Serialize>(path: &Path, data: &T) -> Result<()> {
     let content = serde_json::to_string_pretty(data)?;
     fs::write(path, content + "\n")?;
+    Ok(())
+}
+
+/// Send one Telegram Bot API request and prove it was accepted.
+///
+/// The Bot API reports failures with HTTP 200 and a JSON body of
+/// `{"ok":false,"description":"..."}` -- an expired token, a wrong chat id, a bot
+/// muted in the channel or a 429 rate limit all look like a successful POST. The
+/// earlier code dropped the response entirely, so every one of those turned into a
+/// published release with no announcement and no error.
+fn telegram_post<F>(token: &str, method: &str, build: F) -> Result<()>
+where
+    F: FnOnce(reqwest::blocking::RequestBuilder) -> reqwest::blocking::RequestBuilder,
+{
+    let url = format!("https://api.telegram.org/bot{token}/{method}");
+
+    let response = build(
+        reqwest::blocking::Client::new()
+            .post(&url)
+            // Without a ceiling a hung Telegram endpoint stalls the release job until the
+            // workflow timeout, which reports nothing about where it stopped.
+            .timeout(Duration::from_secs(120)),
+    )
+    .send()
+    .with_context(|| format!("Telegram {method} request failed"))?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .with_context(|| format!("Telegram {method} returned an unreadable body"))?;
+
+    let parsed: serde_json::Value = serde_json::from_str(&body)
+        .with_context(|| format!("Telegram {method} returned a non-JSON body: {body}"))?;
+
+    if parsed["ok"].as_bool() != Some(true) {
+        let description = parsed["description"].as_str().unwrap_or("no description");
+        let error_code = parsed["error_code"]
+            .as_i64()
+            .unwrap_or(status.as_u16() as i64);
+        return Err(anyhow!(
+            "Telegram {method} was rejected (HTTP {status}, error_code {error_code}): {description}"
+        ));
+    }
+
     Ok(())
 }
 
@@ -235,44 +282,6 @@ pub fn run_cmd_with_env(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn unique_temp_path(name: &str) -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        env::temp_dir().join(format!("{name}-{unique}"))
-    }
-
-    #[test]
-    fn cache_file_name_is_stable_and_keeps_filename() {
-        let name = cache_file_name("https://example.com/toolchain.tar.gz").unwrap();
-        assert_eq!(
-            name,
-            "74caec161bcb4f71d8eb363cf7709f7e2132a464e2ef488b473eec8f0ce43249-toolchain.tar.gz"
-        );
-        assert_eq!(
-            name,
-            cache_file_name("https://example.com/toolchain.tar.gz").unwrap()
-        );
-    }
-
-    #[test]
-    fn file_sha256_hashes_file_content() {
-        let path = unique_temp_path("kokuban-sha-test");
-        fs::write(&path, b"abc").unwrap();
-        assert_eq!(
-            file_sha256(&path).unwrap(),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-        fs::remove_file(path).unwrap();
-    }
-}
-
 pub fn handle_notify(tag_name: String) -> Result<()> {
     let token = env::var("TELEGRAM_BOT_TOKEN").context("Missing TELEGRAM_BOT_TOKEN")?;
     let projects = load_projects()?;
@@ -281,11 +290,21 @@ pub fn handle_notify(tag_name: String) -> Result<()> {
         .get("_globals")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
-    let globals: GlobalConfig = serde_json::from_value(globals_val).unwrap_or(GlobalConfig {
-        broadcast_channel: None,
-        resukisu_chat_id: None,
-        resukisu_topic_id: None,
-    });
+    // A malformed `_globals` used to fall back to "no destinations" silently, which reads
+    // exactly like a release that legitimately had nowhere to go. Say so instead.
+    let globals: GlobalConfig = match serde_json::from_value(globals_val) {
+        Ok(globals) => globals,
+        Err(err) => {
+            eprintln!(
+                "Warning: configs/projects.json `_globals` is malformed ({err}); no notification destinations will be used."
+            );
+            GlobalConfig {
+                broadcast_channel: None,
+                bakasu_chat_id: None,
+                bakasu_topic_id: None,
+            }
+        }
+    };
 
     let mut target_project: Option<ProjectConfig> = None;
     let mut repo_url = "Unknown/Repo".to_string();
@@ -313,10 +332,10 @@ pub fn handle_notify(tag_name: String) -> Result<()> {
     if let Some(chan) = globals.broadcast_channel {
         destinations.push((chan, None));
     }
-    if tag_name.contains("ReSuki")
-        && let Some(chat) = globals.resukisu_chat_id
+    if tag_name.contains("BakaSU")
+        && let Some(chat) = globals.bakasu_chat_id
     {
-        destinations.push((chat, globals.resukisu_topic_id));
+        destinations.push((chat, globals.bakasu_topic_id));
     }
 
     if destinations.is_empty() {
@@ -380,7 +399,6 @@ pub fn handle_notify(tag_name: String) -> Result<()> {
         repo_url, tag_name, name, author, url
     );
 
-    let client = reqwest::blocking::Client::new();
     let temp_download_dir = env::temp_dir().join(format!(
         "kokuban_notify_{}_{}",
         std::process::id(),
@@ -399,16 +417,18 @@ pub fn handle_notify(tag_name: String) -> Result<()> {
             json_body.insert("message_thread_id", serde_json::to_value(tid)?);
         }
 
-        let _ = client
-            .post(format!("https://api.telegram.org/bot{}/sendMessage", token))
-            .json(&json_body)
-            .send();
+        telegram_post(&token, "sendMessage", |request| request.json(&json_body))?;
     }
 
     let assets = release_info["assets"].as_array();
     if let Some(asset_list) = assets {
         for asset in asset_list {
-            let name = asset["name"].as_str().unwrap();
+            // `gh release view --json` is a remote payload: a missing name must not bring
+            // the release job down with a panic.
+            let Some(name) = asset["name"].as_str() else {
+                eprintln!("Skipping release asset without a name: {asset}");
+                continue;
+            };
             let size = asset["size"].as_i64().unwrap_or(0);
 
             if size > 50 * 1024 * 1024 {
@@ -456,13 +476,7 @@ pub fn handle_notify(tag_name: String) -> Result<()> {
                     .file_name(name.to_owned());
                 let form = form.part("document", part);
 
-                let _ = client
-                    .post(format!(
-                        "https://api.telegram.org/bot{}/sendDocument",
-                        token
-                    ))
-                    .multipart(form)
-                    .send();
+                telegram_post(&token, "sendDocument", |request| request.multipart(form))?;
             }
             if asset_path.exists() {
                 fs::remove_file(&asset_path)?;
@@ -475,4 +489,59 @@ pub fn handle_notify(tag_name: String) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bakasu_and_legacy_variants_share_release_identity() {
+        for variant in ["bakasu", "resukisu", "sukisuultra"] {
+            assert_eq!(normalize_variant_name(variant), "bakasu");
+            assert_eq!(variant_suffix(variant), "BakaSU");
+            assert!(is_bakasu_variant(variant));
+        }
+        assert_eq!(variant_suffix("main"), "LKM");
+        assert_eq!(variant_suffix("lkm"), "LKM");
+        assert!(!is_bakasu_variant("main"));
+        assert_eq!(
+            normalize_variant_name("feature-resukisu"),
+            "feature-resukisu"
+        );
+    }
+
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_path(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        env::temp_dir().join(format!("{name}-{unique}"))
+    }
+
+    #[test]
+    fn cache_file_name_is_stable_and_keeps_filename() {
+        let name = cache_file_name("https://example.com/toolchain.tar.gz").unwrap();
+        assert_eq!(
+            name,
+            "74caec161bcb4f71d8eb363cf7709f7e2132a464e2ef488b473eec8f0ce43249-toolchain.tar.gz"
+        );
+        assert_eq!(
+            name,
+            cache_file_name("https://example.com/toolchain.tar.gz").unwrap()
+        );
+    }
+
+    #[test]
+    fn file_sha256_hashes_file_content() {
+        let path = unique_temp_path("kokuban-sha-test");
+        fs::write(&path, b"abc").unwrap();
+        assert_eq!(
+            file_sha256(&path).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        fs::remove_file(path).unwrap();
+    }
 }

@@ -1,7 +1,7 @@
 name: Trigger Central Build
 on:
   push:
-    branches: [ main, resukisu ]
+    branches: [ main, bakasu ]
 jobs:
   trigger:
     runs-on: ubuntu-latest
@@ -17,6 +17,6 @@ jobs:
             {
               "project": "__PROJECT_KEY__",
               "branch": "${{ github.ref_name }}",
-              "apply_susfs": true,
-              "apply_bbg": true
+              "apply_bbg": false,
+              "apply_hybridmount": true
             }

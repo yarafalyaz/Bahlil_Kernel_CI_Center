@@ -8,6 +8,7 @@
     "repo": "yarafalyaz/android_kernel_xiaomi_sm8850",
     "defconfig": "gki_defconfig",
     "localversion_base": "-Pertamax16-Nezha-Bahlil-Ganteng",
+    "expected_kernel_version": "6.12.69",
     "supported_ksu": [
       "resukisu"
     ],
@@ -27,19 +28,16 @@
     "lto": "none",
     "anykernel_config": "canoe",
     "zip_name_prefix": "Nezha_Bahlil_Kernel",
+    "readme_placeholders": {
+      "DEVICE_NAME_CN": "小米 17 系列",
+      "DEVICE_NAME_EN": "Xiaomi 17 Series"
+    },
     "susfs": {
       "repo": "https://gitlab.com/simonpunk/susfs4ksu.git",
       "branch": "gki-android16-6.12",
       "patch_path": "kernel_patches/50_add_susfs_in_gki-android16-6.12.patch",
       "fs_patch_dir": "kernel_patches/fs",
       "include_linux_patch_dir": "kernel_patches/include/linux"
-    },
-    "bbg": {
-      "setup_url": "https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh"
-    },
-    "readme_placeholders": {
-      "DEVICE_NAME_CN": "小米 17 系列",
-      "DEVICE_NAME_EN": "Xiaomi 17 Series"
     }
   }
 }

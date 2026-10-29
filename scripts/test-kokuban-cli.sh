@@ -20,20 +20,21 @@ trap 'rm -rf "$tmpdir"' EXIT
 
 export KOKUBAN_CONFIG="$tmpdir/config"
 
-output="$(KOKUBAN_CORE=/bin/echo "$KOKUBAN" build nezha_sm8850 resukisu resukisu --no-bbg)"
-assert_contains "$output" "local --project nezha_sm8850 --branch resukisu --variant resukisu"
+output="$(KOKUBAN_CORE=/bin/echo "$KOKUBAN" build nezha_sm8850 main resukisu --no-bbg --with-susfs)"
+assert_contains "$output" "local --project nezha_sm8850 --branch bakasu --variant bakasu"
 assert_contains "$output" "--apply-bbg false"
+assert_contains "$output" "--apply-hybridmount false"
 
-output="$(KOKUBAN_CORE=/bin/echo "$KOKUBAN" plan nezha_sm8850 resukisu default --no-susfs --no-bbg)"
+output="$(KOKUBAN_CORE=/bin/echo "$KOKUBAN" plan nezha_sm8850 main default --no-bbg)"
 assert_contains "$output" "--dry-run"
-assert_contains "$output" "--apply-susfs false"
 assert_contains "$output" "--apply-bbg false"
 
-"$KOKUBAN" config set apply_susfs false >/dev/null
+"$KOKUBAN" config set apply_bbg false >/dev/null
 output="$("$KOKUBAN" plan nezha_sm8850)"
-assert_contains "$output" "apply_susfs: false"
+assert_contains "$output" "apply_bbg: false"
+assert_contains "$output" "apply_hybridmount: true"
 
-"$KOKUBAN" preset set daily nezha_sm8850 resukisu resukisu --no-bbg >/dev/null
+"$KOKUBAN" preset set daily nezha_sm8850 main resukisu --no-bbg >/dev/null
 output="$("$KOKUBAN" run daily --offline --dry-run)"
 assert_contains "$output" "apply_bbg: false"
 assert_contains "$output" "offline: true"

@@ -29,19 +29,33 @@ on:
         type: string
         required: false
         default: ''
-      resukisu_setup_arg:
-        description: 'ReSukiSU setup.sh argument override'
+      bakasu_setup_arg:
+        description: 'BakaSU setup.sh argument override'
         type: string
         required: false
         default: ''
-      apply_susfs:
-        description: 'Apply SuSFS dynamically during build'
-        type: boolean
-        default: true
       apply_bbg:
         description: 'Apply Baseband Guard dynamically during build'
         type: boolean
         default: false
+      apply_susfs:
+        description: 'Apply SuSFS dynamically during build'
+        type: boolean
+        default: true
+      apply_hybridmount:
+        description: 'Integrate Hybrid Mount VFS dynamically during build'
+        type: boolean
+        default: true
+      kconfig_fragment:
+        description: 'Kconfig fragment override: path in the kernel tree (e.g. Kokuban/profiles/stage3.fragment). Empty = project default'
+        type: string
+        required: false
+        default: ''
+      lto:
+        description: 'LTO override: none | thin | full. Empty = project default'
+        type: string
+        required: false
+        default: ''
   repository_dispatch:
     types: [build-kernel]
   workflow_call:
@@ -61,19 +75,38 @@ on:
       custom_localversion:
         type: string
         default: ''
-      resukisu_setup_arg:
+      bakasu_setup_arg:
         type: string
         default: ''
-      apply_susfs:
-        type: boolean
-        default: true
       apply_bbg:
         type: boolean
         default: false
+      apply_susfs:
+        type: boolean
+        default: true
+      apply_hybridmount:
+        type: boolean
+        default: true
+      kconfig_fragment:
+        type: string
+        default: ''
+      lto:
+        type: string
+        default: ''
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Keep the host environment aligned with Dockerfile. Ubuntu 26.04's libc
+    # headers trigger const-pointer errors in the older kernels' libbpf host
+    # tools (strchr/strstr), failing resolve_btfids before the kernel can build.
+    runs-on: ubuntu-24.04
+    # At most one build per project: a second request for the same project waits for the
+    # running one instead of piling up. Different projects land in different groups, so a
+    # serialized wave is unaffected. Job-level so that it also applies when this workflow
+    # is called as a reusable workflow.
+    concurrency:
+      group: kernel-build-${{ inputs.project || github.event.client_payload.project || github.run_id }}
+      cancel-in-progress: false
     permissions:
       contents: write
     env:
@@ -82,31 +115,58 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Resolve Build Parameters
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PAYLOAD_PROJECT: ${{ github.event.client_payload.project }}
+          PAYLOAD_BRANCH: ${{ github.event.client_payload.branch }}
+          PAYLOAD_APPLY_BBG: ${{ github.event.client_payload.apply_bbg }}
+          PAYLOAD_APPLY_SUSFS: ${{ github.event.client_payload.apply_susfs }}
+          PAYLOAD_APPLY_HYBRIDMOUNT: ${{ github.event.client_payload.apply_hybridmount }}
+          INPUT_PROJECT: ${{ inputs.project }}
+          INPUT_BRANCH: ${{ inputs.branch }}
+          INPUT_KSU_VARIANT: ${{ inputs.ksu_variant }}
+          INPUT_DO_RELEASE: ${{ inputs.do_release }}
+          INPUT_CUSTOM_LOCALVERSION: ${{ inputs.custom_localversion }}
+          INPUT_BAKASU_SETUP_ARG: ${{ inputs.bakasu_setup_arg }}
+          INPUT_APPLY_BBG: ${{ inputs.apply_bbg }}
+          INPUT_APPLY_SUSFS: ${{ inputs.apply_susfs }}
+          INPUT_APPLY_HYBRIDMOUNT: ${{ inputs.apply_hybridmount }}
+          INPUT_KCONFIG_FRAGMENT: ${{ inputs.kconfig_fragment }}
+          INPUT_LTO: ${{ inputs.lto }}
         run: |
-          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
-            project="${{ github.event.client_payload.project }}"
-            branch="${{ github.event.client_payload.branch }}"
+          if [ "$EVENT_NAME" = "repository_dispatch" ]; then
+            project="$PAYLOAD_PROJECT"
+            branch="$PAYLOAD_BRANCH"
             variant="default"
             release="true"
             custom_localversion=""
-            resukisu_setup_arg=""
-            apply_susfs="${{ github.event.client_payload.apply_susfs }}"
-            apply_bbg="${{ github.event.client_payload.apply_bbg }}"
-            if [ -z "$apply_susfs" ]; then
-              apply_susfs="true"
-            fi
+            bakasu_setup_arg=""
+            apply_bbg="$PAYLOAD_APPLY_BBG"
+            apply_susfs="$PAYLOAD_APPLY_SUSFS"
+            apply_hybridmount="$PAYLOAD_APPLY_HYBRIDMOUNT"
+            kconfig_fragment=""
+            lto=""
             if [ -z "$apply_bbg" ]; then
               apply_bbg="false"
             fi
+            if [ -z "$apply_susfs" ]; then
+              apply_susfs="true"
+            fi
+            if [ -z "$apply_hybridmount" ]; then
+              apply_hybridmount="true"
+            fi
           else
-            project="${{ inputs.project }}"
-            branch="${{ inputs.branch }}"
-            variant="${{ inputs.ksu_variant }}"
-            release="${{ inputs.do_release }}"
-            custom_localversion="${{ inputs.custom_localversion }}"
-            resukisu_setup_arg="${{ inputs.resukisu_setup_arg }}"
-            apply_susfs="${{ inputs.apply_susfs }}"
-            apply_bbg="${{ inputs.apply_bbg }}"
+            project="$INPUT_PROJECT"
+            branch="$INPUT_BRANCH"
+            variant="$INPUT_KSU_VARIANT"
+            release="$INPUT_DO_RELEASE"
+            custom_localversion="$INPUT_CUSTOM_LOCALVERSION"
+            bakasu_setup_arg="$INPUT_BAKASU_SETUP_ARG"
+            apply_bbg="$INPUT_APPLY_BBG"
+            apply_susfs="$INPUT_APPLY_SUSFS"
+            apply_hybridmount="$INPUT_APPLY_HYBRIDMOUNT"
+            kconfig_fragment="$INPUT_KCONFIG_FRAGMENT"
+            lto="$INPUT_LTO"
           fi
 
           if [ "$variant" = "default" ] || [ -z "$variant" ]; then
@@ -118,6 +178,14 @@ jobs:
           safe_artifact_branch=$(printf '%s' "$branch" | sed 's#[^A-Za-z0-9._-]#-#g')
           artifact_name="${project}-kernel-${safe_artifact_branch}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
+          # Cache per build shape, not per project: the variant, the tuning profile and
+          # the feature flags all change the sources, and two runs sharing one key race
+          # on restore ("tar: Error is not recoverable") instead of missing the cache.
+          profile_slug=$(printf '%s' \
+            "${resolved_variant}-${kconfig_fragment:-default}-${lto:-none}-h${apply_hybridmount}-b${apply_bbg}-s${apply_susfs}" \
+            | sed 's#[^A-Za-z0-9]#-#g')
+          cache_key_suffix="${profile_slug}"
+
           {
             echo "PROJECT=$project"
             echo "BRANCH_TARGET=$branch"
@@ -125,21 +193,37 @@ jobs:
             echo "VARIANT=$resolved_variant"
             echo "DO_RELEASE=$release"
             echo "CUSTOM_LOCALVERSION=$custom_localversion"
-            echo "RESUKISU_SETUP_ARG=$resukisu_setup_arg"
-            echo "APPLY_SUSFS=$apply_susfs"
+            echo "BAKASU_SETUP_ARG=$bakasu_setup_arg"
             echo "APPLY_BBG=$apply_bbg"
+            echo "APPLY_SUSFS=$apply_susfs"
+            echo "APPLY_HYBRIDMOUNT=$apply_hybridmount"
+            echo "KCONFIG_FRAGMENT=$kconfig_fragment"
+            echo "LTO_OVERRIDE=$lto"
+            echo "CACHE_KEY_SUFFIX=$cache_key_suffix"
             echo "ARTIFACT_NAME=$artifact_name"
           } >> "$GITHUB_ENV"
 
+      - name: Setup Rust for preview builds
+        if: github.ref != 'refs/heads/main'
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.92.0
+
+      - name: Build preview CI Core
+        if: github.ref != 'refs/heads/main'
+        run: |
+          cargo build --release --locked --manifest-path ci_core_rs/Cargo.toml
+          cp ci_core_rs/target/release/bahlil_ci_core ./bahlil_ci_core
+
       - name: Download CI Core
+        if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
-          gh release download ci-core-latest -p "bahlil_ci_core"
-          chmod +x bahlil_ci_core
+          ./scripts/fetch-ci-core.sh
 
       - name: Parse Configuration
-        run: ./bahlil_ci_core parse --project ${{ env.PROJECT }}
+        run: ./bahlil_ci_core parse --project "$PROJECT"
 
       - name: Checkout Kernel Source
         uses: actions/checkout@v7
@@ -151,16 +235,21 @@ jobs:
           token: ${{ secrets.GH_TOKEN }}
 
       - name: Setup sccache
-        uses: hendrikmuhs/ccache-action@v1.2.23
+        uses: hendrikmuhs/ccache-action@v1.2.24
         with:
           variant: sccache
-          key: kernel-build-shared-${{ env.PROJECT }}
+          # The exact key is per build shape so two concurrent runs never save the
+          # same entry, but any shape of this project is a valid fallback: sccache
+          # is content addressed, so a restored object from another variant is
+          # either reused as-is or ignored, never wrong.
+          key: kernel-build-shared-${{ env.PROJECT }}-${{ env.CACHE_KEY_SUFFIX }}
+          restore-keys: kernel-build-shared-${{ env.PROJECT }}-
           max-size: 5G
 
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential git libncurses5-dev bc bison flex libssl-dev p7zip-full lz4 cpio curl libelf-dev dwarves jq lld pahole libdw-dev
+          sudo apt-get install -y python3 patch build-essential git libncurses5-dev bc bison flex libssl-dev p7zip-full pigz lz4 cpio curl libelf-dev dwarves jq lld pahole libdw-dev binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi gcc-arm-linux-gnueabi
           echo "$HOME/.local/bin" >> $GITHUB_PATH
 
       - name: Ensure compat cross-linker
@@ -180,15 +269,22 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
-          ARGS=(--project ${{ env.PROJECT }} --branch ${{ env.VARIANT }} --do-release ${{ env.DO_RELEASE }})
-          if [ -n "${{ env.CUSTOM_LOCALVERSION }}" ]; then
-            ARGS+=("--custom-localversion=${{ env.CUSTOM_LOCALVERSION }}")
+          ARGS=(--project "$PROJECT" --branch "$VARIANT" --do-release "$DO_RELEASE")
+          if [ -n "$CUSTOM_LOCALVERSION" ]; then
+            ARGS+=("--custom-localversion=$CUSTOM_LOCALVERSION")
           fi
-          if [ -n "${{ env.RESUKISU_SETUP_ARG }}" ]; then
-            ARGS+=("--resukisu-setup-arg=${{ env.RESUKISU_SETUP_ARG }}")
+          if [ -n "$BAKASU_SETUP_ARG" ]; then
+            ARGS+=("--bakasu-setup-arg=$BAKASU_SETUP_ARG")
           fi
-          ARGS+=("--apply-susfs" "${{ env.APPLY_SUSFS }}")
-          ARGS+=("--apply-bbg" "${{ env.APPLY_BBG }}")
+          if [ -n "$KCONFIG_FRAGMENT" ]; then
+            ARGS+=("--kconfig-fragment=$KCONFIG_FRAGMENT")
+          fi
+          if [ -n "$LTO_OVERRIDE" ]; then
+            ARGS+=("--lto=$LTO_OVERRIDE")
+          fi
+          ARGS+=("--apply-susfs" "$APPLY_SUSFS")
+          ARGS+=("--apply-bbg" "$APPLY_BBG")
+          ARGS+=("--apply-hybridmount" "$APPLY_HYBRIDMOUNT")
           ./bahlil_ci_core build "${ARGS[@]}"
 
       - name: Collect Build Artifacts

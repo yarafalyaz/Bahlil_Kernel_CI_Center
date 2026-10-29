@@ -1,7 +1,10 @@
 mod admin;
 mod build;
+mod build_jobs;
 mod config;
+mod git_auth;
 mod local;
+mod pixel4;
 mod settings;
 mod utils;
 
@@ -17,6 +20,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::git_auth::github_clone_url;
 use crate::utils::*;
 
 #[derive(Parser)]
@@ -46,6 +50,9 @@ struct AddOptions {
     zip_name: String,
     #[arg(long, default_value = "")]
     toolchain_prefix: String,
+    /// Build pipeline for this project, e.g. `gki-6.12` for ACK/GKI trees.
+    #[arg(long)]
+    build_style: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -68,7 +75,11 @@ enum Commands {
     Features {
         project: Option<String>,
     },
-    Validate,
+    Validate {
+        /// Treat warnings (such as a toolchain URL with no recorded digest) as failures.
+        #[arg(long)]
+        strict: bool,
+    },
     Cache {
         #[command(subcommand)]
         command: CacheCommands,
@@ -103,6 +114,12 @@ enum Commands {
         #[arg(long, default_value = "both")]
         readme_language: String,
     },
+    /// Print the content stamp of the `ci_core_rs` tree this binary was built from.
+    ///
+    /// Callers that download the moving `ci-core-latest` release use it to prove they are
+    /// running a core that matches the tree they are driving, instead of silently executing
+    /// an older core whose checks are missing.
+    Stamp,
     Watch,
     Update {
         #[arg(long)]
@@ -128,11 +145,19 @@ enum Commands {
         #[arg(long, allow_hyphen_values = true)]
         custom_localversion: Option<String>,
         #[arg(long, allow_hyphen_values = true)]
-        resukisu_setup_arg: Option<String>,
+        bakasu_setup_arg: Option<String>,
         #[arg(long, action = clap::ArgAction::Set)]
         apply_susfs: bool,
         #[arg(long, action = clap::ArgAction::Set)]
         apply_bbg: bool,
+        #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
+        apply_hybridmount: bool,
+        /// Override the project's kconfig fragment for this run (tuning profile).
+        #[arg(long)]
+        kconfig_fragment: Option<String>,
+        /// Override the project's LTO setting for this run: none | thin | full.
+        #[arg(long)]
+        lto: Option<String>,
     },
     Local {
         #[arg(long)]
@@ -146,7 +171,7 @@ enum Commands {
         #[arg(long, allow_hyphen_values = true)]
         custom_localversion: Option<String>,
         #[arg(long, allow_hyphen_values = true)]
-        resukisu_setup_arg: Option<String>,
+        bakasu_setup_arg: Option<String>,
         #[arg(long, action = clap::ArgAction::Set)]
         apply_susfs: Option<bool>,
         #[arg(long, action = clap::ArgAction::SetTrue)]
@@ -159,6 +184,18 @@ enum Commands {
         with_bbg: bool,
         #[arg(long, action = clap::ArgAction::SetTrue)]
         no_bbg: bool,
+        #[arg(long, action = clap::ArgAction::Set)]
+        apply_hybridmount: Option<bool>,
+        #[arg(long, action = clap::ArgAction::SetTrue)]
+        with_hybridmount: bool,
+        #[arg(long, action = clap::ArgAction::SetTrue)]
+        no_hybridmount: bool,
+        /// Override the project's kconfig fragment for this run (tuning profile).
+        #[arg(long)]
+        kconfig_fragment: Option<String>,
+        /// Override the project's LTO setting for this run: none | thin | full.
+        #[arg(long)]
+        lto: Option<String>,
         #[arg(long)]
         local_root: Option<PathBuf>,
         #[arg(long, action = clap::ArgAction::SetTrue)]
@@ -262,7 +299,7 @@ fn main() -> Result<()> {
         },
         Commands::Run { name, extra_args } => admin::handle_run_preset(name, extra_args),
         Commands::Features { project } => admin::handle_features(project),
-        Commands::Validate => admin::handle_validate(),
+        Commands::Validate { strict } => admin::handle_validate(strict),
         Commands::Cache { command } => match command {
             CacheCommands::Status { local_root } => admin::handle_cache_status(local_root),
             CacheCommands::Clean {
@@ -292,6 +329,10 @@ fn main() -> Result<()> {
             commit_message,
             readme_language,
         } => handle_setup(token, commit_message, readme_language),
+        Commands::Stamp => {
+            println!("{}", env!("KOKUBAN_CORE_TREE"));
+            Ok(())
+        }
         Commands::Watch => handle_watch(),
         Commands::Update {
             token,
@@ -305,31 +346,42 @@ fn main() -> Result<()> {
             branch,
             do_release,
             custom_localversion,
-            resukisu_setup_arg,
+            bakasu_setup_arg,
             apply_susfs,
             apply_bbg,
-        } => build::handle_build(
-            project,
+            apply_hybridmount,
+            kconfig_fragment,
+            lto,
+        } => build::handle_build(build::BuildOptions {
+            project_key: project,
             branch,
             do_release,
             custom_localversion,
-            resukisu_setup_arg,
+            bakasu_setup_arg,
             apply_susfs,
             apply_bbg,
-        ),
+            apply_hybridmount,
+            kconfig_fragment,
+            lto,
+        }),
         Commands::Local {
             project,
             branch,
             variant,
             do_release,
             custom_localversion,
-            resukisu_setup_arg,
+            bakasu_setup_arg,
             apply_susfs,
             with_susfs,
             no_susfs,
             apply_bbg,
             with_bbg,
             no_bbg,
+            apply_hybridmount,
+            with_hybridmount,
+            no_hybridmount,
+            kconfig_fragment,
+            lto,
             local_root,
             offline,
             no_fetch,
@@ -340,10 +392,8 @@ fn main() -> Result<()> {
             let settings = settings::load_settings()?;
             let resolved_susfs = if no_susfs {
                 false
-            } else if with_susfs {
-                true
             } else {
-                apply_susfs.unwrap_or(settings.apply_susfs)
+                with_susfs || apply_susfs.unwrap_or(false)
             };
             let resolved_bbg = if no_bbg {
                 false
@@ -352,15 +402,25 @@ fn main() -> Result<()> {
             } else {
                 apply_bbg.unwrap_or(settings.apply_bbg)
             };
+            let resolved_hybridmount = if no_hybridmount {
+                false
+            } else if with_hybridmount {
+                true
+            } else {
+                apply_hybridmount.unwrap_or(settings.apply_hybridmount)
+            };
             local::handle_local_build(LocalBuildOptions {
                 project,
                 branch,
                 variant,
                 do_release,
                 custom_localversion,
-                resukisu_setup_arg,
+                bakasu_setup_arg,
                 apply_susfs: resolved_susfs,
                 apply_bbg: resolved_bbg,
+                apply_hybridmount: resolved_hybridmount,
+                kconfig_fragment,
+                lto,
                 local_root: local_root.or(settings.local_root),
                 offline,
                 no_fetch,
@@ -414,6 +474,13 @@ fn build_project_matrix_entries(
     project_key: &str,
     proj: &ProjectConfig,
 ) -> Vec<HashMap<String, String>> {
+    if crate::pixel4::is_pixel4(proj.build_style.as_deref()) {
+        return vec![HashMap::from([
+            ("project".to_string(), project_key.to_string()),
+            ("branch".to_string(), "bakasu".to_string()),
+            ("ksu_variant".to_string(), "bakasu".to_string()),
+        ])];
+    }
     let raw_supported = proj.supported_ksu.clone().unwrap_or_default();
     let mut include = vec![HashMap::from([
         ("project".to_string(), project_key.to_string()),
@@ -423,10 +490,10 @@ fn build_project_matrix_entries(
 
     for variant in raw_supported {
         let normalized = normalize_variant_name(&variant);
-        let entry = if normalized == "resukisu" {
+        let entry = if normalized == "bakasu" {
             HashMap::from([
                 ("project".to_string(), project_key.to_string()),
-                ("branch".to_string(), "resukisu".to_string()),
+                ("branch".to_string(), "bakasu".to_string()),
                 ("ksu_variant".to_string(), "default".to_string()),
             ])
         } else {
@@ -512,8 +579,9 @@ fn handle_add(options: AddOptions) -> Result<()> {
         repo: options.repo,
         defconfig: options.defconfig,
         localversion_base: options.localversion,
+        expected_kernel_version: None,
         lto: None,
-        supported_ksu: Some(vec!["resukisu".to_string()]),
+        supported_ksu: Some(vec!["bakasu".to_string()]),
         toolchain_urls: None,
         toolchain_sha256: None,
         toolchain_path_prefix: if options.toolchain_prefix.is_empty() {
@@ -525,6 +593,10 @@ fn handle_add(options: AddOptions) -> Result<()> {
         anykernel_config: options.ak3_config,
         zip_name_prefix: Some(options.zip_name),
         version_method: None,
+        build_style: options.build_style,
+        abi_symbol_gates: None,
+        kconfig_fragment: None,
+        abi_baseline: None,
         extra_host_env: None,
         disable_security: None,
         readme_placeholders: Some(placeholders),
@@ -554,7 +626,7 @@ fn handle_setup(
     let trigger_tpl = fs::read_to_string(get_template_path("trigger-central-build.yml.tpl"))?;
 
     run_cmd(
-        &["git", "config", "--global", "user.name", "Bahlil-Bot"],
+        &["git", "config", "--global", "user.name", "Kokuban-Bot"],
         None,
         false,
     )?;
@@ -575,11 +647,7 @@ fn handle_setup(
         println!("Processing project: {} -> {}", key, repo_url);
 
         let target_dir = workspace.join(&key);
-        let auth_url = if let Some(t) = &token {
-            format!("https://{}@github.com/{}.git", t, repo_url)
-        } else {
-            format!("https://github.com/{}.git", repo_url)
-        };
+        let auth_url = github_clone_url(&repo_url, token.as_deref());
 
         if target_dir.exists() {
             fs::remove_dir_all(&target_dir)?;
@@ -592,7 +660,7 @@ fn handle_setup(
         )?;
 
         let readme_content = process_readme(&readme_tpl, &proj, &repo_url, &readme_language);
-        let target_branches = vec!["main", "resukisu"];
+        let target_branches = vec!["main", "bakasu"];
 
         let remote_out =
             run_cmd(&["git", "branch", "-r"], Some(&target_dir), true)?.unwrap_or_default();
@@ -604,24 +672,26 @@ fn handle_setup(
         for branch in target_branches {
             let branch_exists = remote_branches.contains(&branch);
 
-            if branch == "resukisu" && !branch_exists && remote_branches.contains(&"sukisuultra") {
+            let legacy_branch = ["resukisu", "sukisuultra"]
+                .into_iter()
+                .find(|legacy| remote_branches.contains(legacy));
+            if branch == "bakasu"
+                && !branch_exists
+                && let Some(legacy_branch) = legacy_branch
+            {
                 run_cmd(
-                    &["git", "checkout", "sukisuultra"],
+                    &["git", "checkout", legacy_branch],
+                    Some(&target_dir),
+                    false,
+                )?;
+                run_cmd(&["git", "branch", "-m", "bakasu"], Some(&target_dir), false)?;
+                run_cmd(
+                    &["git", "push", "origin", "-u", "bakasu"],
                     Some(&target_dir),
                     false,
                 )?;
                 run_cmd(
-                    &["git", "branch", "-m", "resukisu"],
-                    Some(&target_dir),
-                    false,
-                )?;
-                run_cmd(
-                    &["git", "push", "origin", "-u", "resukisu"],
-                    Some(&target_dir),
-                    false,
-                )?;
-                run_cmd(
-                    &["git", "push", "origin", "--delete", "sukisuultra"],
+                    &["git", "push", "origin", "--delete", legacy_branch],
                     Some(&target_dir),
                     false,
                 )?;
@@ -629,6 +699,10 @@ fn handle_setup(
                 run_cmd(&["git", "checkout", branch], Some(&target_dir), false)?;
             } else {
                 continue;
+            }
+
+            if branch == "bakasu" {
+                build::integrate_bakasu_hooks(&target_dir, &key, &proj.defconfig, None)?;
             }
 
             fs::write(target_dir.join("README.md"), &readme_content)?;
@@ -669,6 +743,9 @@ fn handle_setup(
             }
 
             run_cmd(&["git", "add", "."], Some(&target_dir), false)?;
+            // `.github` is a dot-directory and the universal .gitignore ignores dot-files, so
+            // a trigger that is not tracked yet would be silently dropped from the commit.
+            run_cmd(&["git", "add", "-f", ".github"], Some(&target_dir), false)?;
             let status = run_cmd(&["git", "status", "--porcelain"], Some(&target_dir), true)?;
 
             if !status.unwrap_or_default().is_empty() {
@@ -800,6 +877,9 @@ fn handle_watch() -> Result<()> {
         HashMap::new()
     };
 
+    if let Some(hash) = track_data.remove("resukisu") {
+        track_data.entry("bakasu".to_string()).or_insert(hash);
+    }
     track_data.remove("sukisuultra");
     track_data.remove("ksu");
     track_data.remove("mksu");
@@ -886,7 +966,7 @@ fn handle_update(
         fs::remove_dir_all(&target_dir)?;
     }
 
-    let auth_url = format!("https://{}@github.com/{}.git", token, repo_url);
+    let auth_url = github_clone_url(&repo_url, Some(&token));
     run_cmd(
         &[
             "git",
@@ -920,10 +1000,13 @@ fn handle_update(
 
         run_cmd(&args, Some(&target_dir), false)?;
         fs::remove_file(setup_script)?;
+        if normalized_variant == "bakasu" {
+            build::integrate_bakasu_hooks(&target_dir, &project_key, &proj.defconfig, None)?;
+        }
     }
 
     run_cmd(
-        &["git", "config", "user.name", "Bahlil-Bot"],
+        &["git", "config", "user.name", "Kokuban-Bot"],
         Some(&target_dir),
         false,
     )?;
@@ -942,7 +1025,13 @@ fn handle_update(
                 "git",
                 "commit",
                 "-m",
-                &format!("ci: update {} to {}", normalized_variant, commit_id),
+                // "[skip ci]": the automated source update must not trigger the device
+                // repo's Trigger Central Build. Builds are started centrally, in a
+                // serialized weekly wave (see .github/workflows/upstream-watcher.yml).
+                &format!(
+                    "[skip ci] ci: update {} to {}",
+                    normalized_variant, commit_id
+                ),
             ],
             Some(&target_dir),
             false,

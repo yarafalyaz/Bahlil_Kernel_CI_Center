@@ -6,8 +6,8 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct Settings {
-    pub apply_susfs: bool,
     pub apply_bbg: bool,
+    pub apply_hybridmount: bool,
     pub local_root: Option<PathBuf>,
 }
 
@@ -22,8 +22,8 @@ pub struct Preset {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            apply_susfs: true,
             apply_bbg: false,
+            apply_hybridmount: true,
             local_root: env::var_os("KOKUBAN_LOCAL_ROOT").map(PathBuf::from),
         }
     }
@@ -74,8 +74,8 @@ pub fn load_settings() -> Result<Settings> {
             continue;
         };
         match key.trim() {
-            "apply_susfs" => settings.apply_susfs = bool_value(value.trim())?,
             "apply_bbg" => settings.apply_bbg = bool_value(value.trim())?,
+            "apply_hybridmount" => settings.apply_hybridmount = bool_value(value.trim())?,
             "local_root" => {
                 let value = value.trim();
                 settings.local_root = if value.is_empty() {
@@ -93,7 +93,7 @@ pub fn load_settings() -> Result<Settings> {
 
 pub fn set_config_value(key: &str, value: &str) -> Result<()> {
     let normalized = match key {
-        "apply_susfs" | "apply_bbg" => bool_value(value)?.to_string(),
+        "apply_bbg" | "apply_hybridmount" => bool_value(value)?.to_string(),
         "local_root" => value.to_string(),
         _ => return Err(anyhow!("Unknown config key: {}", key)),
     };

@@ -66,6 +66,7 @@ struct BuildInfo {
     kernel_commit: Option<String>,
     apply_susfs: bool,
     apply_bbg: bool,
+    apply_hybridmount: bool,
     local_root: String,
     workspace: String,
     kernel_source: String,
@@ -87,9 +88,12 @@ pub struct LocalBuildOptions {
     pub variant: String,
     pub do_release: bool,
     pub custom_localversion: Option<String>,
-    pub resukisu_setup_arg: Option<String>,
+    pub bakasu_setup_arg: Option<String>,
     pub apply_susfs: bool,
     pub apply_bbg: bool,
+    pub apply_hybridmount: bool,
+    pub kconfig_fragment: Option<String>,
+    pub lto: Option<String>,
     pub local_root: Option<PathBuf>,
     pub offline: bool,
     pub no_fetch: bool,
@@ -119,7 +123,7 @@ pub fn ensure_local_host() -> Result<()> {
 
     if !missing.is_empty() {
         return Err(anyhow!(
-            "Missing local build dependencies: {}\nUbuntu install hint:\n  sudo apt-get update && sudo apt-get install -y build-essential git libncurses5-dev bc bison flex libssl-dev p7zip-full lz4 cpio curl wget libelf-dev dwarves jq lld pahole libdw-dev unzip zip",
+            "Missing local build dependencies: {}\nUbuntu install hint:\n  sudo apt-get update && sudo apt-get install -y build-essential git libncurses5-dev bc bison flex libssl-dev p7zip-full pigz lz4 cpio curl wget libelf-dev dwarves jq lld pahole libdw-dev unzip zip",
             missing.join(", ")
         ));
     }
@@ -149,8 +153,26 @@ fn lock_holder_pid(path: &Path) -> Option<u32> {
     })
 }
 
+/// Whether a process holding a lock is still running.
+///
+/// This used to test `/proc/<pid>`, which only exists on Linux. On macOS -- where the CLI
+/// builds and runs fine -- the check answered "dead" for every pid, so a lock held by a
+/// *live* build was deleted as stale and two processes could rewrite the same mirror.
+/// The POSIX `kill -0` probe asks the same question without pinning the answer to /proc.
 fn pid_is_alive(pid: u32) -> bool {
-    Path::new("/proc").join(pid.to_string()).exists()
+    match Command::new("kill").arg("-0").arg(pid.to_string()).output() {
+        Ok(output) if output.status.success() => true,
+        // A pid owned by another user answers EPERM and is very much alive, so every
+        // refusal except an explicit "no such process" must count as alive -- treating
+        // EPERM as stale would reintroduce the very bug this replaced.
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+            !stderr.contains("no such process")
+        }
+        // The probe could not run at all; assume the holder is alive so a lock is never
+        // reclaimed on a guess. `--force-lock` stays the explicit escape hatch.
+        Err(_) => true,
+    }
 }
 
 fn acquire_project_lock(local_root: &Path, project: &str, force: bool) -> Result<LocalLock> {
@@ -439,6 +461,8 @@ fn run_build_command(
         .arg(options.apply_susfs.to_string())
         .arg("--apply-bbg")
         .arg(options.apply_bbg.to_string())
+        .arg("--apply-hybridmount")
+        .arg(options.apply_hybridmount.to_string())
         .current_dir(run_dir)
         .env("CI_CENTRAL_ROOT", central_root)
         .env("KOKUBAN_REUSE_TOOLCHAINS", "1")
@@ -466,9 +490,15 @@ fn run_build_command(
     );
     add_optional_arg(
         &mut command,
-        "--resukisu-setup-arg",
-        options.resukisu_setup_arg.as_deref(),
+        "--bakasu-setup-arg",
+        options.bakasu_setup_arg.as_deref(),
     );
+    add_optional_arg(
+        &mut command,
+        "--kconfig-fragment",
+        options.kconfig_fragment.as_deref(),
+    );
+    add_optional_arg(&mut command, "--lto", options.lto.as_deref());
 
     if let Some(parent) = log_path.parent() {
         fs::create_dir_all(parent)?;
@@ -603,30 +633,43 @@ fn archive_artifacts(
     let artifact_dir = local_root.join("artifacts").join(project).join(build_id);
     fs::create_dir_all(&artifact_dir)?;
 
-    let mut copied = false;
+    // A build log is written for every run, including failures, so it must not count as
+    // evidence that the build produced something worth publishing.
+    let mut produced_artifacts = false;
     for entry in fs::read_dir(run_dir)? {
         let path = entry?.path();
         if path.extension().and_then(|ext| ext.to_str()) == Some("zip") {
-            copied |= copy_if_exists(&path, &artifact_dir)?;
+            produced_artifacts |= copy_if_exists(&path, &artifact_dir)?;
         }
     }
 
     for source in [
         run_dir.join("kernel_source/out/.config"),
         run_dir.join("kernel_source/out/vmlinux.symvers"),
-        log_path.to_path_buf(),
     ] {
-        copied |= copy_if_exists(&source, &artifact_dir)?;
+        produced_artifacts |= copy_if_exists(&source, &artifact_dir)?;
+    }
+
+    let copied_log = copy_if_exists(log_path, &artifact_dir)?;
+
+    if !produced_artifacts {
+        // Keep the directory: it holds the copied build log, which is what makes a failed run
+        // debuggable. Only the `latest` pointer is left alone.
+        println!(
+            "No build artifacts were produced for {}; keeping the previous 'latest'.",
+            project
+        );
+        return Ok(artifact_dir);
     }
 
     let latest_path = local_root.join("artifacts").join(project).join("latest");
     replace_latest_symlink(&latest_path, &artifact_dir)?;
 
-    if copied {
+    if copied_log {
         println!("Archived local artifacts into {}", artifact_dir.display());
     } else {
         println!(
-            "Created artifact directory {}, but no build artifacts were found.",
+            "Archived local artifacts into {} (build log unavailable).",
             artifact_dir.display()
         );
     }
@@ -719,6 +762,7 @@ fn print_plan(plan: &LocalBuildPlan<'_>) {
     println!("  release: {}", plan.options.do_release);
     println!("  apply_susfs: {}", plan.options.apply_susfs);
     println!("  apply_bbg: {}", plan.options.apply_bbg);
+    println!("  apply_hybridmount: {}", plan.options.apply_hybridmount);
     println!("  offline: {}", plan.options.offline);
     println!("  no_fetch: {}", plan.options.no_fetch);
     println!("  clean: {}", plan.options.clean);
@@ -845,6 +889,7 @@ pub fn handle_local_build(options: LocalBuildOptions) -> Result<()> {
         kernel_commit,
         apply_susfs: options.apply_susfs,
         apply_bbg: options.apply_bbg,
+        apply_hybridmount: options.apply_hybridmount,
         local_root: local_root.display().to_string(),
         workspace: run_dir.display().to_string(),
         kernel_source: source_dir.display().to_string(),
@@ -883,8 +928,8 @@ mod tests {
     #[test]
     fn sanitizes_path_components() {
         assert_eq!(
-            sanitize_path_component("s25/sm8750 resukisu"),
-            "s25-sm8750-resukisu"
+            sanitize_path_component("s25/sm8750 bakasu"),
+            "s25-sm8750-bakasu"
         );
         assert_eq!(sanitize_path_component("///"), "default");
     }
@@ -911,6 +956,63 @@ mod tests {
         assert!(lock.path.exists());
         drop(lock);
         assert!(!lock_dir.join("test.lock").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // A run that produced no artifacts must not steal the `latest` pointer: downstream
+    // consumers resolve that symlink to fetch the newest kernel, so pointing it at an empty
+    // directory turns a failed build into a broken "latest" release.
+    #[test]
+    fn archive_without_artifacts_keeps_existing_latest() {
+        let root = unique_temp_path("kokuban-latest-test");
+        let project = "testproj";
+
+        // A previous successful build.
+        let good_run = root.join("runs/good");
+        fs::create_dir_all(&good_run).unwrap();
+        fs::write(good_run.join("Kernel-good.zip"), "zip").unwrap();
+        let log = root.join("good.log");
+        fs::write(&log, "ok\n").unwrap();
+        let good_dir = archive_artifacts(&root, project, &good_run, "good-build", &log).unwrap();
+
+        // A later run that produced nothing.
+        let empty_run = root.join("runs/empty");
+        fs::create_dir_all(&empty_run).unwrap();
+        let empty_log = root.join("empty.log");
+        fs::write(&empty_log, "failed\n").unwrap();
+        archive_artifacts(&root, project, &empty_run, "empty-build", &empty_log).unwrap();
+
+        let latest = root.join("artifacts").join(project).join("latest");
+        let resolved = fs::read_link(&latest).unwrap();
+        assert_eq!(
+            resolved, good_dir,
+            "latest must still point at the last build that actually produced artifacts"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // The returned directory is used afterwards (build-info.json is written into it), so it
+    // must still exist even when the run produced no publishable artifacts.
+    #[test]
+    fn archive_keeps_directory_when_nothing_was_produced() {
+        let root = unique_temp_path("kokuban-empty-archive-test");
+        let project = "testproj";
+        let run = root.join("runs/failed");
+        fs::create_dir_all(&run).unwrap();
+        let log = root.join("failed.log");
+        fs::write(&log, "build failed\n").unwrap();
+
+        let dir = archive_artifacts(&root, project, &run, "failed-build", &log).unwrap();
+
+        assert!(dir.is_dir(), "the returned artifact directory must exist");
+        assert!(
+            dir.join("failed.log").exists(),
+            "the failed build's log must be archived for debugging"
+        );
+        assert!(
+            !root.join("artifacts").join(project).join("latest").exists(),
+            "no previous build existed, so 'latest' must not be created"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }

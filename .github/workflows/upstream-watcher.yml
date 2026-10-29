@@ -1,7 +1,10 @@
 name: Watch Upstream KernelSU
 on:
   schedule:
-    - cron: '0 */6 * * *'
+    # Weekly wave (Mondays 00:00 UTC). Detection cadence == build cadence on purpose:
+    # one wave per week keeps Actions usage flat and avoids bursts of upstream traffic.
+    - cron: '0 0 * * 1'
+  # Manual escape hatch: run a wave immediately without waiting for Monday.
   workflow_dispatch:
 
 permissions:
@@ -20,9 +23,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
-          gh release download ci-core-latest -p "bahlil_ci_core" --clobber
-          chmod +x bahlil_ci_core
-          
+          ./scripts/fetch-ci-core.sh
       - name: Check Upstream
         id: watcher
         run: ./bahlil_ci_core watch
@@ -36,11 +37,13 @@ jobs:
           git commit -m "ci: update upstream records"
           git push
 
+  # Serialized fan-out: one kernel repo updated at a time (no burst of clones/pushes).
   update-projects:
     needs: check
     if: needs.check.outputs.found_updates == 'true'
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         include: ${{ fromJson(needs.check.outputs.matrix) }}
     runs-on: ubuntu-latest
@@ -51,13 +54,37 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
-          gh release download ci-core-latest -p "bahlil_ci_core" --clobber
-          chmod +x bahlil_ci_core
-          
+          ./scripts/fetch-ci-core.sh
       - name: Perform Update
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          MATRIX_PROJECT: ${{ matrix.project }}
+          MATRIX_VARIANT: ${{ matrix.variant }}
+          MATRIX_COMMIT_ID: ${{ matrix.commit_id }}
         run: |
           ./bahlil_ci_core update \
-            --token "${{ secrets.GH_TOKEN }}" \
-            --project "${{ matrix.project }}" \
-            --variant "${{ matrix.variant }}" \
-            --commit-id "${{ matrix.commit_id }}"
+            --token "$GH_TOKEN" \
+            --project "$MATRIX_PROJECT" \
+            --variant "$MATRIX_VARIANT" \
+            --commit-id "$MATRIX_COMMIT_ID"
+
+  # The wave's build stage. The update commits carry "[skip ci]", so a kernel repo's
+  # own Trigger Central Build no longer fires: this job is what starts the builds,
+  # strictly one at a time, from the central repo.
+  build-projects:
+    needs: [check, update-projects]
+    if: needs.check.outputs.found_updates == 'true'
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include: ${{ fromJson(needs.check.outputs.matrix) }}
+    uses: ./.github/workflows/build_kernel.yml
+    with:
+      project: ${{ matrix.project }}
+      branch: ${{ matrix.variant }}
+      ksu_variant: default
+      do_release: true
+      apply_bbg: false
+      apply_hybridmount: true
+    secrets: inherit

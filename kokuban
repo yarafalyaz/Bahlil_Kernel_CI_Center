@@ -31,10 +31,10 @@ Common local options:
   --clean               Remove untracked kernel source files before building
   --dry-run             Print the build plan without touching source or caches
   --force-lock          Remove an existing lock for this project before building
-  --with-susfs          Enable SuSFS (default)
-  --no-susfs            Disable SuSFS
   --with-bbg            Enable Baseband Guard
   --no-bbg              Disable Baseband Guard (default)
+  --with-hybridmount    Enable Hybrid Mount (default)
+  --no-hybridmount      Disable Hybrid Mount
 EOF
 }
 
@@ -74,7 +74,10 @@ ensure_core() {
 
   if [ "$needs_build" -eq 1 ]; then
     echo "Building bahlil_ci_core release binary..."
-    cargo build --release --manifest-path "$CORE_DIR/Cargo.toml"
+    # `--locked` so the wrapper resolves the same dependency versions CI does; without
+    # it a local run could drift from Cargo.lock and fail for reasons unrelated to the
+    # change under test.
+    cargo build --release --locked --manifest-path "$CORE_DIR/Cargo.toml"
   fi
 }
 
@@ -87,19 +90,6 @@ normalize_local_args() {
   local args=()
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      --with-susfs|--susfs)
-        args+=(--apply-susfs true)
-        ;;
-      --no-susfs)
-        args+=(--apply-susfs false)
-        ;;
-      --susfs=*|--apply-susfs=*)
-        args+=(--apply-susfs "$(bool_value "${1#*=}")")
-        ;;
-      --apply-susfs)
-        args+=(--apply-susfs "$(bool_value "${2:?Missing value for --apply-susfs}")")
-        shift
-        ;;
       --with-bbg|--bbg)
         args+=(--apply-bbg true)
         ;;
@@ -111,6 +101,19 @@ normalize_local_args() {
         ;;
       --apply-bbg)
         args+=(--apply-bbg "$(bool_value "${2:?Missing value for --apply-bbg}")")
+        shift
+        ;;
+      --with-hybridmount|--hybridmount)
+        args+=(--apply-hybridmount true)
+        ;;
+      --no-hybridmount)
+        args+=(--apply-hybridmount false)
+        ;;
+      --hybridmount=*|--apply-hybridmount=*)
+        args+=(--apply-hybridmount "$(bool_value "${1#*=}")")
+        ;;
+      --apply-hybridmount)
+        args+=(--apply-hybridmount "$(bool_value "${2:?Missing value for --apply-hybridmount}")")
         shift
         ;;
       *)
