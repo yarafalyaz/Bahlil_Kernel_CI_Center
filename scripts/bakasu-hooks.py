@@ -53,7 +53,7 @@ def version_of(source):
                  for field in ('VERSION', 'PATCHLEVEL'))
 
 
-def missing_hooks(source, version):
+def missing_hooks(source, version, allow_susfs=False):
     required = {path: list(names) for path, names in BASE.items()}
     if auto_lsm(version) == 'n':
         required['kernel/sys.c'] = ['ksu_handle_setresuid']
@@ -61,7 +61,7 @@ def missing_hooks(source, version):
     missing = []
     for path, names in required.items():
         content = (source / path).read_text()
-        if re.search(r'\b(?:CONFIG_KSU_SUSFS\w*|susfs_\w+)\b', code_only(content)):
+        if not allow_susfs and re.search(r'\b(?:CONFIG_KSU_SUSFS\w*|susfs_\w+)\b', code_only(content)):
             raise ValueError(f'{path}: retired filesystem hooks remain; use a clean source checkout')
         for name in names:
             if not has_call(content, name):
@@ -96,14 +96,15 @@ def config_values(path):
     return values
 
 
-def check_config(path, version):
+def check_config(path, version, allow_susfs=False):
     values = config_values(path)
     for key, wanted in required_config(version).items():
         if values.get(key, 'n') != wanted:
             raise ValueError(f'{path}: {key} must be {wanted}, got {values.get(key, "n")}')
-    for key, value in values.items():
-        if 'SUSFS' in key and value not in ('n', '""'):
-            raise ValueError(f'{path}: removed feature is still enabled: {key}')
+    if not allow_susfs:
+        for key, value in values.items():
+            if 'SUSFS' in key and value not in ('n', '""'):
+                raise ValueError(f'{path}: removed feature is still enabled: {key}')
 
 
 def configure(path, version):
@@ -146,13 +147,15 @@ def main():
     parser.add_argument('--project', required=True)
     parser.add_argument('--defconfig', required=True)
     parser.add_argument('--check-config', type=Path)
+    parser.add_argument('--allow-susfs', action='store_true',
+                        help='SuSFS overlay already applied: skip retired-hook and SUSFS-config bans')
     args = parser.parse_args()
     if args.check_config:
         source = kernel_root(args.source)
-        missing = missing_hooks(source, version_of(source))
+        missing = missing_hooks(source, version_of(source), allow_susfs=args.allow_susfs)
         if missing:
             raise ValueError('Missing BakaSU hooks: ' + ', '.join(missing))
-        check_config(args.check_config, version_of(source))
+        check_config(args.check_config, version_of(source), allow_susfs=args.allow_susfs)
     else:
         integrate(args.source, args.project, args.defconfig)
 

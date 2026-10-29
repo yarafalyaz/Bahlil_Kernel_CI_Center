@@ -530,13 +530,18 @@ fn apply_susfs_overlay(
         if !patch_path.exists() {
             return Err(anyhow!("SuSFS patch not found: {:?}", patch_path));
         }
-        if let Ok(content) = fs::read_to_string(&patch_path)
-            && content.contains("getname_flags(filename, lookup_flags, NULL);")
-        {
-            let fixed = content.replace(
-                "getname_flags(filename, lookup_flags, NULL);",
-                "getname_flags(filename, lookup_flags);",
-            );
+        if let Ok(content) = fs::read_to_string(&patch_path) {
+            // BakaSU hook patch renames do_execveat_common -> __do_execveat_common;
+            // SuSFS exec hunks target the vanilla name and fail fuzz-0 context match.
+            let fixed = content
+                .replace(
+                    "getname_flags(filename, lookup_flags, NULL);",
+                    "getname_flags(filename, lookup_flags);",
+                )
+                .replace(
+                    "static int do_execveat_common(int fd, struct filename *filename,",
+                    "static int __do_execveat_common(int fd, struct filename *filename,",
+                );
             let _ = fs::write(&patch_path, fixed);
         }
         let fs_source = temp_dir.join(susfs.fs_patch_dir.as_deref().unwrap_or("kernel_patches/fs"));
@@ -2152,6 +2157,25 @@ pub fn integrate_bakasu_hooks(
     defconfig: &str,
     final_config: Option<&Path>,
 ) -> Result<()> {
+    integrate_bakasu_hooks_inner(source, project, defconfig, final_config, false)
+}
+
+pub fn integrate_bakasu_hooks_allow_susfs(
+    source: &Path,
+    project: &str,
+    defconfig: &str,
+    final_config: Option<&Path>,
+) -> Result<()> {
+    integrate_bakasu_hooks_inner(source, project, defconfig, final_config, true)
+}
+
+fn integrate_bakasu_hooks_inner(
+    source: &Path,
+    project: &str,
+    defconfig: &str,
+    final_config: Option<&Path>,
+    allow_susfs: bool,
+) -> Result<()> {
     let script = crate::utils::get_root_dir().join("scripts/bakasu-hooks.py");
     let mut command = std::process::Command::new("python3");
     command
@@ -2164,6 +2188,9 @@ pub fn integrate_bakasu_hooks(
         .arg(defconfig);
     if let Some(config) = final_config {
         command.arg("--check-config").arg(config);
+    }
+    if allow_susfs {
+        command.arg("--allow-susfs");
     }
     let status = command
         .status()
@@ -3216,12 +3243,22 @@ pub fn handle_build(options: BuildOptions) -> Result<()> {
 
     let final_config = kernel_source_path.join("out/.config");
     if setup_url.is_some() {
-        integrate_bakasu_hooks(
-            &kernel_source_path,
-            &project_key,
-            &proj.defconfig,
-            Some(&final_config),
-        )?;
+        // Post-olddefconfig re-audit runs after SuSFS overlay: allow its symbols/config.
+        if apply_susfs {
+            integrate_bakasu_hooks_allow_susfs(
+                &kernel_source_path,
+                &project_key,
+                &proj.defconfig,
+                Some(&final_config),
+            )?;
+        } else {
+            integrate_bakasu_hooks(
+                &kernel_source_path,
+                &project_key,
+                &proj.defconfig,
+                Some(&final_config),
+            )?;
+        }
         validate_kconfig_entries(&final_config, COMMON_KSU_KCONFIG_ENTRIES)?;
     }
     // Report dropped fragment entries before the ABI checks: if a tuning experiment
