@@ -41,6 +41,19 @@ const COMMON_KSU_KCONFIG_ENTRIES: &[(&str, &str)] = &[
     ),
 ];
 
+// BakaSU Kconfig: KSU_TRACEPOINT_HOOK / KSU_MANUAL_HOOK / KSU_SUSFS are one
+// choice (default TRACEPOINT). Gate script edits defconfig, but `make defconfig`
+// regenerates .config from Kconfig defaults, dropping manual-hook selection.
+// Force the choice (and auto hooks the gate requires) into out/.config too.
+const MANUAL_HOOK_KCONFIG_ENTRIES: &[(&str, &str)] = &[
+    ("CONFIG_KSU_MANUAL_HOOK", "y"),
+    ("CONFIG_KSU_TRACEPOINT_HOOK", "n"),
+    ("CONFIG_KSU_SUSFS", "n"),
+    ("CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK", "n"),
+    ("CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK", "n"),
+    ("CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK", "y"),
+];
+
 fn verify_toolchain_checksum(
     url: &str,
     path: &Path,
@@ -2227,6 +2240,7 @@ fn prepare_gki_build(
     entries.extend_from_slice(GKI_CUSTOM_KCONFIG_ENTRIES);
     if enable_ksu {
         entries.extend_from_slice(COMMON_KSU_KCONFIG_ENTRIES);
+        entries.extend_from_slice(MANUAL_HOOK_KCONFIG_ENTRIES);
     }
     update_kconfig_file(&defconfig_file, &entries)
 }
@@ -3177,6 +3191,10 @@ pub fn handle_build(options: BuildOptions) -> Result<()> {
         update_kconfig_file(
             &kernel_source_path.join("out/.config"),
             COMMON_KSU_KCONFIG_ENTRIES,
+        )?;
+        update_kconfig_file(
+            &kernel_source_path.join("out/.config"),
+            MANUAL_HOOK_KCONFIG_ENTRIES,
         )?;
     }
 
