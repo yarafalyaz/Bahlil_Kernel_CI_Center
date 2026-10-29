@@ -668,6 +668,73 @@ fn apply_patch_with_fallbacks(
     Err(anyhow!("Failed to apply patch {:?}", patch_file))
 }
 
+/// The upstream SuSFS patch targets vanilla GKI task_mmu.c. On kernels where
+/// show_smap()/show_smaps_rollup() diverge (e.g. vma_pages() instead of
+/// vma_data_pages(), rewritten rollup loop), GNU patch with fuzz 3 silently
+/// lands three SUS_MAP hunks in wrong functions (smaps_rollup_open and
+/// pte_is_pinned), which then fails to compile ('vma' undeclared).
+/// Detect those exact misplacements and re-apply the intent at the correct
+/// anchors. No-op when the patch already applied cleanly; hard error when a
+/// known misplacement is present but an anchor is missing, so we never ship
+/// a silently broken patch.
+fn fix_susfs_task_mmu(kernel_source_path: &Path) -> Result<()> {
+    let path = find_first_existing_dir(
+        kernel_source_path,
+        &[
+            "common/fs/proc".to_string(),
+            "kernel_platform/common/fs/proc".to_string(),
+            "fs/proc".to_string(),
+        ],
+    )
+    .map(|d| d.join("task_mmu.c"))
+    .filter(|p| p.exists());
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let mut content = fs::read_to_string(&path)?;
+
+    // Misplacement A: show_smap() SUS_MAP block landed in smaps_rollup_open().
+    let bad_a = "\tint ret;\n#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n\tif (vma->vm_file) {\n\t\tif (SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))\n\t\t\treturn 0;\n\t}\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n\n";
+    if content.contains(bad_a) {
+        content = content.replacen(bad_a, "\tint ret;\n", 1);
+
+        let anchor = "\tstruct mem_size_stats mss = {};\n\n\tif (!vma_pages(vma))";
+        let fixed = "\tstruct mem_size_stats mss = {};\n\n#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n\tif (vma->vm_file) {\n\t\tif (SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))\n\t\t\treturn 0;\n\t}\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n\n\tif (!vma_pages(vma))";
+        if !content.contains(anchor) {
+            return Err(anyhow!(
+                "SuSFS task_mmu fix: show_smap anchor not found in {:?}",
+                path
+            ));
+        }
+        content = content.replacen(anchor, fixed, 1);
+        println!("Fixed misplaced SuSFS show_smap hunk in task_mmu.c");
+    }
+
+    // Misplacement B: show_smaps_rollup() SUS_MAP check landed in pte_is_pinned().
+    let bad_b = "{\n#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n\t\tif (vma->vm_file && SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))\n\t\t\tgoto bypass_orig_flow;\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n\n\tstruct folio *folio;";
+    let bad_c = "\treturn folio_maybe_dma_pinned(folio);\n#ifdef CONFIG_KSU_SUSFS_SUS_MAP\nbypass_orig_flow:\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n}";
+    if content.contains(bad_b) || content.contains(bad_c) {
+        content = content.replacen(bad_b, "{\n\tstruct folio *folio;", 1);
+        content = content.replacen(bad_c, "\treturn folio_maybe_dma_pinned(folio);\n}", 1);
+
+        // Correct rollup behaviour: skip stats gathering for sus_map VMAs,
+        // still advancing last_vma_end (same as upstream bypass_orig_flow).
+        let gather = "\t\tsmap_gather_stats(vma, &mss, 0);\n\t\tlast_vma_end = vma->vm_end;";
+        let fixed_gather = "#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n\t\tif (!vma->vm_file || !SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n\t\t\tsmap_gather_stats(vma, &mss, 0);\n\t\tlast_vma_end = vma->vm_end;";
+        if !content.contains(gather) {
+            return Err(anyhow!(
+                "SuSFS task_mmu fix: show_smaps_rollup anchor not found in {:?}",
+                path
+            ));
+        }
+        content = content.replacen(gather, fixed_gather, 1);
+        println!("Fixed misplaced SuSFS show_smaps_rollup hunk in task_mmu.c");
+    }
+
+    fs::write(&path, content)?;
+    Ok(())
+}
+
 fn ensure_bbg_lsm(content: &str) -> String {
     let mut lines = Vec::new();
     let mut in_lsm_block = false;
@@ -772,6 +839,8 @@ fn apply_susfs_overlay(kernel_source_path: &Path, susfs: &SusfsConfig) -> Result
         kernel_source_path,
         &["common".to_string(), "kernel_platform/common".to_string()],
     )?;
+
+    fix_susfs_task_mmu(kernel_source_path)?;
 
     let susfs_entries = vec![
         ("CONFIG_KSU_SUSFS", "y"),
